@@ -1,10 +1,12 @@
 //! JMA Atomフィード(eqvol.xml)のパース → `Vec<ItemMeta>`(純粋関数)。
 
+use quick_xml::XmlVersion;
 use quick_xml::Reader;
 use quick_xml::events::Event as XmlEvent;
 
 use crate::error::UpstreamError;
 use crate::jma::id::extract_id_from_url;
+use crate::jma::resolve_entity_ref;
 use crate::types::ItemMeta;
 
 /// entry 内で収集対象のフィールド。
@@ -20,7 +22,8 @@ enum Field {
 /// Atomフィードをパースして entry のメタデータ列を返す(フィード出現順)。
 pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // trim_text は使わない。quick-xml 0.41 ではテキストが実体参照ごとに分割されるため、
+    // 断片単位でトリムすると語間の空白が失われる。累積後 End で一括トリムする。
 
     let mut items = Vec::new();
     let mut current: Option<ItemMeta> = None;
@@ -61,7 +64,7 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
                     for attr in e.attributes().flatten() {
                         if attr.key.local_name().as_ref() == b"href" {
                             meta.link = attr
-                                .unescape_value()
+                                .normalized_value(XmlVersion::Implicit1_0)
                                 .map_err(|e| UpstreamError::Parse(e.to_string()))?
                                 .into_owned();
                         }
@@ -70,10 +73,13 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
             }
             XmlEvent::Text(e) => {
                 if field.is_some() {
-                    text.push_str(
-                        &e.unescape()
-                            .map_err(|e| UpstreamError::Parse(e.to_string()))?,
-                    );
+                    text.push_str(&e.decode().map_err(|e| UpstreamError::Parse(e.to_string()))?);
+                }
+            }
+            XmlEvent::GeneralRef(e) => {
+                // quick-xml 0.41 以降、`&lt;` 等の実体参照は独立イベントで届く
+                if field.is_some() {
+                    text.push_str(&resolve_entity_ref(&e)?);
                 }
             }
             XmlEvent::End(e) => {
@@ -90,7 +96,7 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
                 } else if name == b"author" {
                     in_author = false;
                 } else if let (Some(f), Some(meta)) = (field.take(), current.as_mut()) {
-                    let value = std::mem::take(&mut text);
+                    let value = std::mem::take(&mut text).trim().to_string();
                     match f {
                         Field::Title => meta.title = value,
                         Field::Updated => meta.updated = value,

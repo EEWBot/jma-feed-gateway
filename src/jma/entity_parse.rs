@@ -5,6 +5,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event as XmlEvent;
 
 use crate::error::UpstreamError;
+use crate::jma::resolve_entity_ref;
 
 /// 電文XMLの Control / Head から抽出したメタ情報。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,11 +29,16 @@ pub struct EntityMeta {
 /// 電文XMLをパースして Control/Head のメタ情報を返す。
 pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // trim_text は使わない。quick-xml 0.41 ではテキストが実体参照ごとに分割されるため、
+    // 断片単位でトリムすると語間の空白が失われる。バッファに累積し End で一括トリムする。
 
     let mut meta = EntityMeta::default();
     // ローカル名のスタック(名前空間は無視)
     let mut stack: Vec<String> = Vec::new();
+    // 現在の要素のテキスト断片を溜めるバッファ。
+    // quick-xml 0.41 以降、テキストは実体参照(GeneralRef)ごとに分割されて届くため、
+    // End で確定させるまで累積する必要がある。
+    let mut buf = String::new();
 
     loop {
         match reader.read_event().map_err(|e| {
@@ -41,14 +47,16 @@ pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
             XmlEvent::Start(e) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 stack.push(name);
-            }
-            XmlEvent::End(_) => {
-                stack.pop();
+                buf.clear();
             }
             XmlEvent::Text(e) => {
-                let text = e
-                    .unescape()
-                    .map_err(|e| UpstreamError::Parse(e.to_string()))?;
+                buf.push_str(&e.decode().map_err(|e| UpstreamError::Parse(e.to_string()))?);
+            }
+            XmlEvent::GeneralRef(e) => {
+                buf.push_str(&resolve_entity_ref(&e)?);
+            }
+            XmlEvent::End(_) => {
+                // pop 前のスタック末尾が、いま閉じた要素のパス。
                 let target = match path_tail(&stack) {
                     ["Control", "Title"] => Some(&mut meta.title),
                     ["Control", "DateTime"] => Some(&mut meta.date_time),
@@ -62,8 +70,10 @@ pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
                 if let Some(slot) = target
                     && slot.is_empty()
                 {
-                    *slot = text.into_owned();
+                    *slot = buf.trim().to_string();
                 }
+                buf.clear();
+                stack.pop();
             }
             XmlEvent::Eof => break,
             _ => {}
