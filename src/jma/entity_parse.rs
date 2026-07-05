@@ -35,10 +35,9 @@ pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
     let mut stack: Vec<String> = Vec::new();
 
     loop {
-        match reader
-            .read_event()
-            .map_err(|e| UpstreamError::Parse(format!("xml error at {}: {e}", reader.error_position())))?
-        {
+        match reader.read_event().map_err(|e| {
+            UpstreamError::Parse(format!("xml error at {}: {e}", reader.error_position()))
+        })? {
             XmlEvent::Start(e) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 stack.push(name);

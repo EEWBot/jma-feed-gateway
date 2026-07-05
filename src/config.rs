@@ -52,6 +52,11 @@ pub struct HttpConfig {
 pub struct JmaConfig {
     /// 初期一覧のAtomフィードURL。
     pub feed_url: String,
+    /// 長期フィード(eqvol_l.xml)のURL。ウォームアップ時のバックフィルに使う。
+    pub long_feed_url: String,
+    /// ウォームアップ時に採用する電文種別コード。空なら全通過。
+    #[serde(default)]
+    pub telegram_types: Vec<String>,
     /// 実体XMLのベースURL(キャッシュミス時の307先)。
     pub data_base_url: String,
     pub fetch_timeout_secs: u64,
@@ -114,13 +119,24 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         if self.http.bind_addr.is_empty() {
-            return Err(ConfigError::Invalid("http.bind_addr must not be empty".into()));
+            return Err(ConfigError::Invalid(
+                "http.bind_addr must not be empty".into(),
+            ));
         }
         if self.jma.feed_url.is_empty() {
-            return Err(ConfigError::Invalid("jma.feed_url must not be empty".into()));
+            return Err(ConfigError::Invalid(
+                "jma.feed_url must not be empty".into(),
+            ));
+        }
+        if self.jma.long_feed_url.is_empty() {
+            return Err(ConfigError::Invalid(
+                "jma.long_feed_url must not be empty".into(),
+            ));
         }
         if self.jma.data_base_url.is_empty() {
-            return Err(ConfigError::Invalid("jma.data_base_url must not be empty".into()));
+            return Err(ConfigError::Invalid(
+                "jma.data_base_url must not be empty".into(),
+            ));
         }
         if self.dmdata.ws_endpoints.is_empty() || self.dmdata.ws_endpoints.len() > 2 {
             return Err(ConfigError::Invalid(
@@ -128,10 +144,14 @@ impl Config {
             ));
         }
         if self.cache.feed_entries == 0 {
-            return Err(ConfigError::Invalid("cache.feed_entries must be > 0".into()));
+            return Err(ConfigError::Invalid(
+                "cache.feed_entries must be > 0".into(),
+            ));
         }
         if self.cache.entity_capacity == 0 {
-            return Err(ConfigError::Invalid("cache.entity_capacity must be > 0".into()));
+            return Err(ConfigError::Invalid(
+                "cache.entity_capacity must be > 0".into(),
+            ));
         }
         Ok(())
     }
@@ -152,6 +172,13 @@ mod tests {
             )
             .expect("default config must load");
             assert_eq!(config.http.bind_addr, "127.0.0.1:8080");
+            assert_eq!(
+                config.jma.long_feed_url,
+                "https://www.data.jma.go.jp/developer/xml/feed/eqvol_l.xml"
+            );
+            assert_eq!(config.jma.telegram_types.len(), 15);
+            assert!(config.jma.telegram_types.iter().any(|t| t == "VXSE53"));
+            assert_eq!(config.dmdata.types, config.jma.telegram_types);
             assert_eq!(config.dmdata.ws_endpoints.len(), 2);
             assert_eq!(config.dmdata.classifications, vec!["telegram.earthquake"]);
             assert!(config.dmdata.api_key.is_none());
@@ -207,10 +234,7 @@ mod tests {
     #[test]
     fn invalid_ws_endpoints_rejected() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "JMA_RELAY__DMDATA__WS_ENDPOINTS",
-                r#"["a", "b", "c"]"#,
-            );
+            jail.set_env("JMA_RELAY__DMDATA__WS_ENDPOINTS", r#"["a", "b", "c"]"#);
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),

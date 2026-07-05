@@ -82,8 +82,7 @@ mod tests {
 
     #[test]
     fn gzip_base64_roundtrip() {
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(XML.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
         let encoded = BASE64.encode(&compressed);

@@ -38,7 +38,9 @@ pub fn render(metas: &[crate::types::ItemMeta], base_url: &str) -> Bytes {
     let mut feed = BytesStart::new("feed");
     feed.push_attribute(("xmlns", ATOM_NS));
     feed.push_attribute(("xml:lang", "ja"));
-    writer.write_event(XmlEvent::Start(feed)).expect("write to Vec cannot fail");
+    writer
+        .write_event(XmlEvent::Start(feed))
+        .expect("write to Vec cannot fail");
 
     write_text_element(&mut writer, "title", "高頻度(地震火山)");
     write_text_element(&mut writer, "subtitle", "JMAXML relay feed");
@@ -47,7 +49,9 @@ pub fn render(metas: &[crate::types::ItemMeta], base_url: &str) -> Bytes {
     let mut link = BytesStart::new("link");
     link.push_attribute(("rel", "self"));
     link.push_attribute(("href", format!("{base}{FEED_PATH}").as_str()));
-    writer.write_event(XmlEvent::Empty(link)).expect("write to Vec cannot fail");
+    writer
+        .write_event(XmlEvent::Empty(link))
+        .expect("write to Vec cannot fail");
     write_text_element(
         &mut writer,
         "rights",
@@ -64,7 +68,9 @@ pub fn render(metas: &[crate::types::ItemMeta], base_url: &str) -> Bytes {
         let mut link = BytesStart::new("link");
         link.push_attribute(("type", "application/xml"));
         link.push_attribute(("href", entry_url.as_str()));
-        writer.write_event(XmlEvent::Empty(link)).expect("write to Vec cannot fail");
+        writer
+            .write_event(XmlEvent::Empty(link))
+            .expect("write to Vec cannot fail");
         write_text_element(&mut writer, "updated", &meta.updated);
         writer
             .write_event(XmlEvent::Start(BytesStart::new("author")))
@@ -75,7 +81,9 @@ pub fn render(metas: &[crate::types::ItemMeta], base_url: &str) -> Bytes {
             .expect("write to Vec cannot fail");
         let mut content = BytesStart::new("content");
         content.push_attribute(("type", "text"));
-        writer.write_event(XmlEvent::Start(content)).expect("write to Vec cannot fail");
+        writer
+            .write_event(XmlEvent::Start(content))
+            .expect("write to Vec cannot fail");
         // BytesText::new は書き込み時に自動エスケープする
         writer
             .write_event(XmlEvent::Text(BytesText::new(&meta.content)))

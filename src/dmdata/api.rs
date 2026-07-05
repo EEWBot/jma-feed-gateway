@@ -177,7 +177,10 @@ impl DmdataApi {
         if response.status() != StatusCode::OK {
             return Err(Self::api_error(response).await);
         }
-        response.json::<SocketList>().await.map_err(DmdataError::Http)
+        response
+            .json::<SocketList>()
+            .await
+            .map_err(DmdataError::Http)
     }
 
     /// DELETE /socket/{id} — ソケット切断。404(既に閉じている)は成功扱い。
@@ -246,7 +249,10 @@ mod tests {
             None,
             "jma-relay-1".into(),
         );
-        let response = api(&server).socket_start(&request).await.expect("must succeed");
+        let response = api(&server)
+            .socket_start(&request)
+            .await
+            .expect("must succeed");
         assert_eq!(response.ticket, "TICKET123");
         assert_eq!(response.websocket.unwrap().id, 555);
     }
@@ -302,7 +308,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/socket/101"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))

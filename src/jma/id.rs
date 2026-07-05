@@ -12,6 +12,13 @@ pub fn extract_id_from_url(url: &str) -> Option<&str> {
     if id.is_empty() { None } else { Some(id) }
 }
 
+/// 素のID `{datetime}_{serial}_{type}_{office}` から電文種別コード(第3フィールド)を取り出す。
+/// UUID等アンダースコア区切りでないIDは None。
+pub fn telegram_type(id: &str) -> Option<&str> {
+    let t = id.split('_').nth(2)?;
+    (!t.is_empty()).then_some(t)
+}
+
 /// DMDATA data由来のentryにはJMA採番のIDが含まれないため、決定的な合成IDを生成する。
 /// 形式: `{Control/DateTimeのyyyyMMddHHmmss}_{serial or 0}_{電文種別コード}_{EventID}`
 /// 決定的なので2系統(tokyo/osaka)間でも一致する。
@@ -44,8 +51,18 @@ mod tests {
 
     #[test]
     fn synthesize_is_deterministic() {
-        let a = synthesize_id("2026-07-05T04:10:00+09:00", Some("2"), "VXSE53", "20260705041000");
-        let b = synthesize_id("2026-07-05T04:10:00+09:00", Some("2"), "VXSE53", "20260705041000");
+        let a = synthesize_id(
+            "2026-07-05T04:10:00+09:00",
+            Some("2"),
+            "VXSE53",
+            "20260705041000",
+        );
+        let b = synthesize_id(
+            "2026-07-05T04:10:00+09:00",
+            Some("2"),
+            "VXSE53",
+            "20260705041000",
+        );
         assert_eq!(a, b);
         assert_eq!(a, "20260705041000_2_VXSE53_20260705041000");
     }
@@ -59,6 +76,18 @@ mod tests {
     }
 
     #[test]
+    fn telegram_type_extracts_third_field() {
+        assert_eq!(
+            telegram_type("20260705050045_0_VXSE53_010000"),
+            Some("VXSE53")
+        );
+        // UUID(アンダースコア区切りでない)は None
+        assert_eq!(telegram_type("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b"), None);
+        // 第3フィールドが空の場合も None
+        assert_eq!(telegram_type("a__"), None);
+    }
+
+    #[test]
     fn extract_id_from_url_works() {
         assert_eq!(
             extract_id_from_url(
@@ -66,7 +95,10 @@ mod tests {
             ),
             Some("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b")
         );
-        assert_eq!(extract_id_from_url("https://host/data/abc.xml?x=1"), Some("abc"));
+        assert_eq!(
+            extract_id_from_url("https://host/data/abc.xml?x=1"),
+            Some("abc")
+        );
         assert_eq!(extract_id_from_url("abc.xml"), Some("abc"));
         assert_eq!(extract_id_from_url("https://host/data/"), None);
     }

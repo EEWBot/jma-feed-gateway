@@ -6,16 +6,23 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
 
+use crate::fetcher;
 use crate::http::etag;
 use crate::state::SharedState;
-use crate::fetcher;
 
 const ATOM_CONTENT_TYPE: &str = "application/atom+xml; charset=utf-8";
 const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
 
 /// If-None-Match を評価して 200(body) か 304(bodyなし+ETag再送)を返す。
-fn serve_cached(headers: &HeaderMap, etag_value: &str, body: Bytes, content_type: &'static str) -> Response {
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+fn serve_cached(
+    headers: &HeaderMap,
+    etag_value: &str,
+    body: Bytes,
+    content_type: &'static str,
+) -> Response {
+    if let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
         && etag::if_none_match(inm, etag_value)
     {
         // RFC 9110: 304 は body 無しで ETag を再送する
@@ -40,7 +47,12 @@ fn serve_cached(headers: &HeaderMap, etag_value: &str, body: Bytes, content_type
 pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     // Guard を .await 跨ぎで持たないよう load_full で Arc を取り出す
     let snapshot = state.feed.load_full();
-    serve_cached(&headers, &snapshot.etag, snapshot.body.clone(), ATOM_CONTENT_TYPE)
+    serve_cached(
+        &headers,
+        &snapshot.etag,
+        snapshot.body.clone(),
+        ATOM_CONTENT_TYPE,
+    )
 }
 
 /// GET /developer/xml/data/{file}

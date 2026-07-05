@@ -10,6 +10,14 @@ public_base_url = "http://127.0.0.1:8080"
 
 [jma]
 feed_url = "https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml"
+long_feed_url = "https://www.data.jma.go.jp/developer/xml/feed/eqvol_l.xml"
+# ウォームアップ時に採用する電文種別コード。空リストで全通過。
+telegram_types = [
+    "VXSE51", "VXSE52", "VXSE53", "VXSE56", "VXSE60", "VXSE61", "VXSE62",
+    "VYSE50", "VYSE51", "VYSE52", "VYSE60",
+    "VTSE41", "VTSE51", "VTSE52",
+    "VZSE40",
+]
 data_base_url = "https://www.data.jma.go.jp/developer/xml/data"
 fetch_timeout_secs = 30
 retry_attempts = 5
@@ -22,7 +30,14 @@ ws_endpoints = [
     "wss://ws-osaka.api.dmdata.jp/v2/websocket",
 ]
 classifications = ["telegram.earthquake"]
-types = []
+# DMDATAサーバー側の電文type絞り込み(これはDMDATAサーバー側フィルター)。
+# `types = []` にすると従来どおり全typeを受信する。
+types = [
+    "VXSE51", "VXSE52", "VXSE53", "VXSE56", "VXSE60", "VXSE61", "VXSE62",
+    "VYSE50", "VYSE51", "VYSE52", "VYSE60",
+    "VTSE41", "VTSE51", "VTSE52",
+    "VZSE40",
+]
 app_name = "jma-relay"
 cleanup_stale_sockets = true
 

@@ -64,7 +64,11 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(config: Arc<Config>, client: reqwest::Client, event_tx: mpsc::Sender<Event>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        client: reqwest::Client,
+        event_tx: mpsc::Sender<Event>,
+    ) -> Self {
         let entities = moka::future::Cache::builder()
             .max_capacity(config.cache.entity_capacity)
             .time_to_live(Duration::from_secs(config.cache.entity_ttl_secs))

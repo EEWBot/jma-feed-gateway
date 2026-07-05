@@ -47,7 +47,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
     publish(&state, &mut metas, &base_url);
 
     let deduper = Deduper::new(Duration::from_secs(state.config.cache.seen_ttl_secs));
-    state.readiness.aggregator_running.store(true, Ordering::Relaxed);
+    state
+        .readiness
+        .aggregator_running
+        .store(true, Ordering::Relaxed);
     tracing::info!(entries = metas.len(), "aggregator started");
 
     while let Some(event) = rx.recv().await {
@@ -79,7 +82,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         publish(&state, &mut metas, &base_url);
     }
 
-    state.readiness.aggregator_running.store(false, Ordering::Relaxed);
+    state
+        .readiness
+        .aggregator_running
+        .store(false, Ordering::Relaxed);
     tracing::warn!("aggregator stopped (event channel closed)");
 }
 
@@ -91,7 +97,9 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .first()
         .map(|m| m.updated.clone())
         .unwrap_or_else(feed_render::now_jst_rfc3339);
-    state.feed.store(Arc::new(FeedSnapshot::new(body, last_updated)));
+    state
+        .feed
+        .store(Arc::new(FeedSnapshot::new(body, last_updated)));
 }
 
 #[cfg(test)]

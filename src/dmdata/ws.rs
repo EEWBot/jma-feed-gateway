@@ -100,7 +100,11 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
     }
     let telegram_type = head.telegram_type.clone();
 
-    let xml_body = decode_body(&data.body, data.compression.as_deref(), data.encoding.as_deref())?;
+    let xml_body = decode_body(
+        &data.body,
+        data.compression.as_deref(),
+        data.encoding.as_deref(),
+    )?;
 
     // メタ抽出は展開済みXML(Control/Head)を正とし、xmlReport(JSON)はフォールバック
     let entity_meta = std::str::from_utf8(&xml_body)
@@ -123,22 +127,36 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
     // 決定的な合成ID(2系統間でも一致)
     let id = synthesize_id(
         &control_datetime,
-        if serial.is_empty() { None } else { Some(serial.as_str()) },
+        if serial.is_empty() {
+            None
+        } else {
+            Some(serial.as_str())
+        },
         &telegram_type,
         &event_id,
     );
 
-    let mut updated = pick(&entity_meta.report_date_time, xml_head.report_date_time.as_ref());
+    let mut updated = pick(
+        &entity_meta.report_date_time,
+        xml_head.report_date_time.as_ref(),
+    );
     if updated.is_empty() {
         updated = head.time.clone().unwrap_or_default();
     }
     let title = pick(&entity_meta.title, control.title.as_ref());
-    let author = pick(&entity_meta.publishing_office, control.publishing_office.as_ref());
+    let author = pick(
+        &entity_meta.publishing_office,
+        control.publishing_office.as_ref(),
+    );
     let content = pick(&entity_meta.headline_text, xml_head.headline.as_ref());
 
     let meta = ItemMeta {
         id: id.clone(),
-        title: if title.is_empty() { telegram_type.clone() } else { title },
+        title: if title.is_empty() {
+            telegram_type.clone()
+        } else {
+            title
+        },
         updated: updated.clone(),
         author,
         content,
@@ -241,7 +259,11 @@ async fn run_session(
                     .iter()
                     .filter(|item| item.app_name.as_deref() == Some(app_name))
                 {
-                    tracing::info!(conn = index, socket_id = item.id, "closing stale dmdata socket");
+                    tracing::info!(
+                        conn = index,
+                        socket_id = item.id,
+                        "closing stale dmdata socket"
+                    );
                     if let Err(e) = api.socket_close(item.id).await {
                         tracing::warn!(conn = index, socket_id = item.id, error = %e, "failed to close stale socket");
                     }
@@ -328,7 +350,10 @@ mod tests {
 
     #[test]
     fn start_returns_started() {
-        assert!(matches!(handle_ws_message(START_JSON, 0), WsAction::Started));
+        assert!(matches!(
+            handle_ws_message(START_JSON, 0),
+            WsAction::Started
+        ));
     }
 
     #[test]
@@ -369,7 +394,10 @@ mod tests {
         assert_eq!(event.meta.updated, "2026-07-05T04:10:00+09:00");
         assert_eq!(event.meta.author, "気象庁");
         assert_eq!(event.meta.content, "5日04時05分ころ、地震がありました。");
-        assert_eq!(event.dedup_key, DedupKey::TelegramId("TELEGRAM_ID_1".into()));
+        assert_eq!(
+            event.dedup_key,
+            DedupKey::TelegramId("TELEGRAM_ID_1".into())
+        );
         assert_eq!(
             event.source,
             EventSource::Dmdata {
@@ -377,7 +405,11 @@ mod tests {
                 conn: 1
             }
         );
-        assert!(std::str::from_utf8(&event.xml_body).unwrap().contains("<Report"));
+        assert!(
+            std::str::from_utf8(&event.xml_body)
+                .unwrap()
+                .contains("<Report")
+        );
     }
 
     #[test]

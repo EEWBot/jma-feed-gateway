@@ -29,10 +29,9 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
     let mut text = String::new();
 
     loop {
-        match reader
-            .read_event()
-            .map_err(|e| UpstreamError::Parse(format!("xml error at {}: {e}", reader.error_position())))?
-        {
+        match reader.read_event().map_err(|e| {
+            UpstreamError::Parse(format!("xml error at {}: {e}", reader.error_position()))
+        })? {
             XmlEvent::Start(e) => {
                 let name = e.local_name();
                 let name = name.as_ref();
@@ -71,7 +70,10 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
             }
             XmlEvent::Text(e) => {
                 if field.is_some() {
-                    text.push_str(&e.unescape().map_err(|e| UpstreamError::Parse(e.to_string()))?);
+                    text.push_str(
+                        &e.unescape()
+                            .map_err(|e| UpstreamError::Parse(e.to_string()))?,
+                    );
                 }
             }
             XmlEvent::End(e) => {

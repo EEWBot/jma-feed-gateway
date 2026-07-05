@@ -48,9 +48,10 @@ async fn setup() -> (SharedState, Router) {
     std::mem::forget(rx);
     // フィードスナップショットを設定
     let body = Bytes::from_static(b"<?xml version=\"1.0\"?><feed>test</feed>");
-    state
-        .feed
-        .store(Arc::new(FeedSnapshot::new(body, "2026-07-05T04:10:12+09:00".into())));
+    state.feed.store(Arc::new(FeedSnapshot::new(
+        body,
+        "2026-07-05T04:10:12+09:00".into(),
+    )));
     // 実体キャッシュに1件投入
     let entry = EntityEntry::new(
         Bytes::from_static(b"<Report>cached entity</Report>"),
@@ -103,7 +104,12 @@ async fn feed_200_then_304() {
     let response = get(&router, FEED_PATH, Some(&etag)).await;
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(
-        response.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+        response
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap(),
         etag
     );
     let body = body_bytes(response).await;
@@ -222,10 +228,20 @@ async fn readyz_503_then_200() {
     assert_eq!(json["feed"], false);
     assert_eq!(json["ws"], serde_json::json!([false, false]));
 
-    state.readiness.initial_feed_loaded.store(true, Ordering::Relaxed);
-    state.readiness.aggregator_running.store(true, Ordering::Relaxed);
+    state
+        .readiness
+        .initial_feed_loaded
+        .store(true, Ordering::Relaxed);
+    state
+        .readiness
+        .aggregator_running
+        .store(true, Ordering::Relaxed);
     let response = get(&router, "/readyz", None).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "ws not connected yet");
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ws not connected yet"
+    );
 
     state.readiness.ws_connected[1].store(true, Ordering::Relaxed);
     let response = get(&router, "/readyz", None).await;
