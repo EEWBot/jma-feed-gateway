@@ -51,7 +51,8 @@ multiplier = 2.0
 feed_entries = 100
 # 実体XMLキャッシュの最大件数
 entity_capacity = 1024
-# 実体XMLキャッシュのTTL(秒)。一覧保持期間より十分長くすること(合成ID対策)
+# 実体XMLキャッシュのTTL(秒)。feedから外れて降格したDMDATA由来entryの
+# 配信継続の猶予期間(feed在中はpinnedで保持されるためTTLの影響を受けない)
 entity_ttl_secs = 86400
 # dedup(seen)キャッシュのTTL(秒)
 seen_ttl_secs = 3600

@@ -61,13 +61,17 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
 
         // 実体キャッシュ更新(ETagは事前生成)
         let entry = Arc::new(EntityEntry::new(event.xml_body.clone(), event.meta.clone()));
-        state.entities.insert(event.meta.id.clone(), entry).await;
 
         // キャッシュミス補充(JmaFeed)由来はentities挿入のみで一覧は再生成しない
         if event.source == EventSource::JmaFeed {
+            state.entities.insert(event.meta.id.clone(), entry).await;
             tracing::debug!(id = %event.meta.id, "entity cached (feed unchanged)");
             continue;
         }
+
+        // dmdata由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
+        // 同一id再送は insert がArcを置換する。
+        state.pinned.insert(event.meta.id.clone(), entry);
 
         // 同一idのentryは置換して先頭へ
         if let Some(pos) = metas.iter().position(|m| m.id == event.meta.id) {
@@ -76,7 +80,13 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         tracing::info!(id = %event.meta.id, title = %event.meta.title, "feed entry added");
         metas.push_front(event.meta);
         while metas.len() > capacity {
-            metas.pop_back();
+            if let Some(evicted) = metas.pop_back()
+                && let Some((id, entry)) = state.pinned.remove(&evicted.id)
+            {
+                // feedから外れたdmdata由来entryはmokaへ降格(TTL分の猶予付きで配信継続)。
+                // None(=JMAウォームアップ由来)は上流307でカバーされるため何もしない。
+                state.entities.insert(id, entry).await;
+            }
         }
 
         publish(&state, &mut metas, &base_url);
@@ -97,9 +107,24 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .first()
         .map(|m| m.updated.clone())
         .unwrap_or_else(feed_render::now_jst_rfc3339);
+
+    // Last-Modified 用時刻: パース可能な updated の最大値を取り、前スナップショットより
+    // 小さくならないよう clamp(訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
+    // feed本文の <updated> は従来どおり先頭entryの値のまま。
+    let rfc3339 = time::format_description::well_known::Rfc3339;
+    let max_updated = slice
+        .iter()
+        .filter_map(|m| time::OffsetDateTime::parse(&m.updated, &rfc3339).ok())
+        .max();
+    let previous = state.feed.load().last_modified;
+    let last_modified = match (max_updated, previous) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+
     state
         .feed
-        .store(Arc::new(FeedSnapshot::new(body, last_updated)));
+        .store(Arc::new(FeedSnapshot::new(body, last_updated, last_modified)));
 }
 
 #[cfg(test)]

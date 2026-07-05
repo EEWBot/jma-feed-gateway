@@ -118,23 +118,30 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
     let control_datetime = pick(&entity_meta.date_time, control.date_time.as_ref());
     let event_id = pick(&entity_meta.event_id, xml_head.event_id.as_ref());
     let serial = pick(&entity_meta.serial, xml_head.serial.as_ref());
-    if control_datetime.is_empty() || event_id.is_empty() {
-        return Err(DmdataError::Body(
-            "cannot derive entry id: Control/DateTime or EventID missing".into(),
-        ));
-    }
 
-    // 決定的な合成ID(2系統間でも一致)
-    let id = synthesize_id(
-        &control_datetime,
-        if serial.is_empty() {
-            None
-        } else {
-            Some(serial.as_str())
-        },
-        &telegram_type,
-        &event_id,
-    );
+    // entry ID はDMDATAの電文一意IDをそのまま使う。
+    // 電文IDが空のまれな場合のみ合成IDへフォールバック(そのときだけ
+    // Control/DateTime と EventID が必須)。
+    let id = if !data.id.is_empty() {
+        data.id.clone()
+    } else {
+        if control_datetime.is_empty() || event_id.is_empty() {
+            return Err(DmdataError::Body(
+                "cannot derive entry id: Control/DateTime or EventID missing".into(),
+            ));
+        }
+        // 決定的な合成ID(2系統間でも一致)
+        synthesize_id(
+            &control_datetime,
+            if serial.is_empty() {
+                None
+            } else {
+                Some(serial.as_str())
+            },
+            &telegram_type,
+            &event_id,
+        )
+    };
 
     let mut updated = pick(
         &entity_meta.report_date_time,
@@ -160,7 +167,8 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
         updated: updated.clone(),
         author,
         content,
-        // 合成IDはJMA本家に存在しないため上流URLなし
+        // DMDATA電文ID(および合成ID)はJMA本家に存在しないため上流URLなし。
+        // feed_render が自サーバの data URL を自動生成する
         link: String::new(),
     };
 
@@ -388,8 +396,8 @@ mod tests {
         let WsAction::Publish(event) = handle_ws_message(DATA_JSON, 1) else {
             panic!("expected publish");
         };
-        // 合成ID: Control/DateTime(UTC) + Serial + 電文種別 + EventID
-        assert_eq!(event.meta.id, "20260704191000_2_VXSE53_20260705040500");
+        // entry ID はDMDATA電文一意IDをそのまま使う
+        assert_eq!(event.meta.id, "TELEGRAM_ID_1");
         assert_eq!(event.meta.title, "震源・震度に関する情報");
         assert_eq!(event.meta.updated, "2026-07-05T04:10:00+09:00");
         assert_eq!(event.meta.author, "気象庁");
@@ -413,11 +421,18 @@ mod tests {
     }
 
     #[test]
-    fn data_synthetic_id_is_deterministic_across_connections() {
-        let WsAction::Publish(a) = handle_ws_message(DATA_JSON, 0) else {
-            panic!()
+    fn data_with_empty_id_falls_back_to_synthetic_id() {
+        let mut value: serde_json::Value = serde_json::from_str(DATA_JSON).unwrap();
+        value["id"] = serde_json::Value::String(String::new());
+        let text = value.to_string();
+
+        let WsAction::Publish(a) = handle_ws_message(&text, 0) else {
+            panic!("expected publish via synthetic id fallback");
         };
-        let WsAction::Publish(b) = handle_ws_message(DATA_JSON, 1) else {
+        // 合成ID: Control/DateTime(UTC) + Serial + 電文種別 + EventID
+        assert_eq!(a.meta.id, "20260704191000_2_VXSE53_20260705040500");
+        // 決定的なので2系統間でも一致する
+        let WsAction::Publish(b) = handle_ws_message(&text, 1) else {
             panic!()
         };
         assert_eq!(a.meta.id, b.meta.id);
@@ -432,7 +447,7 @@ mod tests {
         let WsAction::Publish(event) = handle_ws_message(&text, 0) else {
             panic!("expected publish via xmlReport fallback");
         };
-        assert_eq!(event.meta.id, "20260704191000_2_VXSE53_20260705040500");
+        assert_eq!(event.meta.id, "TELEGRAM_ID_1");
         assert_eq!(event.meta.title, "震源・震度に関する情報");
         assert_eq!(event.meta.author, "気象庁");
     }
@@ -447,7 +462,9 @@ mod tests {
 
     #[test]
     fn data_without_derivable_id_returns_none() {
+        // 電文IDが空 + 合成IDの材料(Control/DateTime, EventID)も無い
         let mut value: serde_json::Value = serde_json::from_str(DATA_JSON).unwrap();
+        value["id"] = serde_json::Value::String(String::new());
         value["body"] = serde_json::Value::String("<Report/>".into());
         value["xmlReport"] = serde_json::Value::Null;
         let text = value.to_string();

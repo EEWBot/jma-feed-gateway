@@ -7,7 +7,8 @@ use crate::http::etag::compute_etag;
 /// Atom entry 1件分のメタデータ。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemMeta {
-    /// entry ID(JMA UUID または DMDATA 由来の合成ID。URLではなく素のID)。
+    /// entry ID(JMA実ID、またはDMDATA電文一意ID(まれに合成IDフォールバック)。
+    /// URLではなく素のID)。
     pub id: String,
     /// Control/Title 相当。
     pub title: String,
@@ -83,6 +84,26 @@ impl EntityEntry {
     }
 }
 
+/// `Last-Modified` 用のIMF-fixdate整形。
+/// `Rfc2822` は `+0000` を出力し有効なHTTP-dateにならないためカスタム記述を使う。
+const IMF_FIXDATE: &[time::format_description::BorrowedFormatItem<'static>] = time::macros::format_description!(
+    "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+);
+
+/// `OffsetDateTime` をIMF-fixdate文字列(UTC)に整形する。
+pub fn format_imf_fixdate(dt: time::OffsetDateTime) -> String {
+    dt.to_offset(time::UtcOffset::UTC)
+        .format(&IMF_FIXDATE)
+        .expect("imf-fixdate formatting cannot fail")
+}
+
+/// IMF-fixdate文字列をパースする(UTCとして解釈)。
+pub fn parse_imf_fixdate(s: &str) -> Option<time::OffsetDateTime> {
+    time::PrimitiveDateTime::parse(s.trim(), &IMF_FIXDATE)
+        .ok()
+        .map(time::PrimitiveDateTime::assume_utc)
+}
+
 /// 完成済みAtomフィードのスナップショット。`ArcSwap<FeedSnapshot>` で保持する。
 #[derive(Debug)]
 pub struct FeedSnapshot {
@@ -92,20 +113,31 @@ pub struct FeedSnapshot {
     pub etag: String,
     /// フィードの updated(RFC3339文字列)。
     pub last_updated: String,
+    /// `Last-Modified` 用時刻(単調化済み。aggregator::publish が計算)。
+    pub last_modified: Option<time::OffsetDateTime>,
+    /// `last_modified` のIMF-fixdate文字列(事前計算)。
+    pub last_modified_http: Option<String>,
 }
 
 impl FeedSnapshot {
-    pub fn new(body: Bytes, last_updated: String) -> Self {
+    pub fn new(
+        body: Bytes,
+        last_updated: String,
+        last_modified: Option<time::OffsetDateTime>,
+    ) -> Self {
         let etag = compute_etag(&body);
+        let last_modified_http = last_modified.map(format_imf_fixdate);
         Self {
             body,
             etag,
             last_updated,
+            last_modified,
+            last_modified_http,
         }
     }
 
     /// 起動直後(初期一覧未取得)用の空スナップショット。
     pub fn empty() -> Self {
-        Self::new(Bytes::new(), String::new())
+        Self::new(Bytes::new(), String::new(), None)
     }
 }

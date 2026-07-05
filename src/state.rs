@@ -53,12 +53,22 @@ pub struct AppState {
     pub feed: ArcSwap<FeedSnapshot>,
     /// 実体XMLキャッシュ。value は Clone 必須のため `Arc<EntityEntry>`。
     pub entities: moka::future::Cache<String, Arc<EntityEntry>>,
+    /// DMDATA由来でフィード在中のentry本体。aggregatorのみ書き込み。
+    /// feedから溢れたら entities(moka) へ降格(TTL分の猶予付きで配信継続)。
+    ///
+    /// 不変条件: `pinned` のキー集合 = feed一覧(metas)中のdmdata由来ID。
+    /// 上限は feed_entries(100件・数MB)に自然に抑えられる。
+    /// 再起動後は pinned 空 + feedはJMAウォームアップIDのみで整合。
+    pub pinned: DashMap<String, Arc<EntityEntry>>,
     /// singleflight 用の先着ガード。fetch 完了/失敗時に必ず remove すること。
     pub inflight: DashMap<String, ()>,
     pub readiness: Readiness,
     pub client: reqwest::Client,
     /// aggregator への Event 送信口。fetch_entity はこれ経由で送る(single-writer 維持)。
     pub event_tx: mpsc::Sender<Event>,
+    /// インスタンス起動時刻(RFC3339、構築時に1回だけ計算)。
+    /// `X-Instance-Started` ヘッダとして返し、再起動検知に使う。
+    pub started_at: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -73,14 +83,19 @@ impl AppState {
             .max_capacity(config.cache.entity_capacity)
             .time_to_live(Duration::from_secs(config.cache.entity_ttl_secs))
             .build();
+        let started_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339 formatting cannot fail");
         Self {
             config,
             feed: ArcSwap::from_pointee(FeedSnapshot::empty()),
             entities,
+            pinned: DashMap::new(),
             inflight: DashMap::new(),
             readiness: Readiness::default(),
             client,
             event_tx,
+            started_at,
         }
     }
 }

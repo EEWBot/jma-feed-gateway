@@ -88,7 +88,7 @@ async fn initial_metas_are_published_on_start() {
 }
 
 #[tokio::test]
-async fn dmdata_event_updates_feed_and_entities() {
+async fn dmdata_event_updates_feed_and_is_pinned() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
@@ -103,11 +103,12 @@ async fn dmdata_event_updates_feed_and_entities() {
     assert!(body.contains("20260705041000_2_VXSE53_E1"));
     assert!(body.contains("震源・震度に関する情報"));
 
+    // dmdata由来はpinnedに載る(entitiesではない)
     let entry = state
-        .entities
+        .pinned
         .get("20260705041000_2_VXSE53_E1")
-        .await
-        .expect("entity must be cached");
+        .map(|e| Arc::clone(e.value()))
+        .expect("dmdata entry must be pinned");
     assert_eq!(
         &entry.body[..],
         b"<Report>20260705041000_2_VXSE53_E1</Report>"
@@ -265,4 +266,137 @@ async fn jma_feed_event_caches_entity_without_feed_rebuild() {
     assert_eq!(snapshot.etag, etag0);
     let feed_body = String::from_utf8(snapshot.body.to_vec()).unwrap();
     assert!(!feed_body.contains("補充された実体"));
+}
+
+#[tokio::test]
+async fn trim_demotes_pinned_entry_to_entities() {
+    let (state, tx) = setup(2, Vec::new()).await;
+    let mut etag = state.feed.load_full().etag.clone();
+
+    for i in 1..=3 {
+        tx.send(dmdata_event(
+            &format!("t-{i}"),
+            meta(
+                &format!("id-{i}"),
+                &format!("entry {i}"),
+                &format!("2026-07-05T04:1{i}:00+09:00"),
+            ),
+        ))
+        .await
+        .unwrap();
+        let _ = wait_for_feed_change(&state, &etag).await;
+        etag = state.feed.load_full().etag.clone();
+    }
+
+    // feedから溢れたid-1はpinnedから外れ、entities(moka)へ降格して配信継続
+    assert!(state.pinned.get("id-1").is_none(), "evicted entry must be unpinned");
+    let entry = state
+        .entities
+        .get("id-1")
+        .await
+        .expect("evicted entry must be demoted to entities");
+    assert_eq!(&entry.body[..], b"<Report>id-1</Report>");
+    // 在中の2件はpinnedのまま
+    assert!(state.pinned.get("id-2").is_some());
+    assert!(state.pinned.get("id-3").is_some());
+    assert_eq!(state.pinned.len(), 2);
+}
+
+#[tokio::test]
+async fn warmup_entries_are_never_pinned() {
+    // ウォームアップ(初期一覧)のmetaは実体を持たずpinnedに載らない。
+    // trimで溢れても何も起きない(上流307でカバー)
+    let initial = vec![
+        meta("20260705040000_0_VXSE53_A", "warmup-1", "2026-07-05T04:00:00+09:00"),
+        meta("20260705035900_0_VXSE53_B", "warmup-2", "2026-07-05T03:59:00+09:00"),
+    ];
+    let (state, tx) = setup(2, initial).await;
+    assert!(state.pinned.is_empty(), "warmup metas must not be pinned");
+    let etag = state.feed.load_full().etag.clone();
+
+    // dmdataイベントでwarmup-2が溢れる
+    tx.send(dmdata_event(
+        "t-new",
+        meta("id-new", "新着", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag).await;
+
+    // 溢れたウォームアップ由来IDはpinnedにもentitiesにも入らない
+    assert!(state.pinned.get("20260705035900_0_VXSE53_B").is_none());
+    assert!(state.entities.get("20260705035900_0_VXSE53_B").await.is_none());
+    // 新着のみピン済み
+    assert_eq!(state.pinned.len(), 1);
+    assert!(state.pinned.get("id-new").is_some());
+}
+
+#[tokio::test]
+async fn same_id_resend_replaces_pin() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(dmdata_event(
+        "t-first",
+        meta("id-same", "更新前", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let etag1 = state.feed.load_full().etag.clone();
+
+    // 同一entry idの再送(dedupキーは別)→ ピンはArc置換され1件のまま
+    let mut item = meta("id-same", "更新後", "2026-07-05T04:12:00+09:00");
+    item.content = "更新後の本文".into();
+    let mut event = dmdata_event("t-second", item);
+    event.xml_body = bytes::Bytes::from_static(b"<Report>updated</Report>");
+    tx.send(event).await.unwrap();
+    wait_for_feed_change(&state, &etag1).await;
+
+    assert_eq!(state.pinned.len(), 1, "same-id resend must replace the pin");
+    let entry = state
+        .pinned
+        .get("id-same")
+        .map(|e| Arc::clone(e.value()))
+        .unwrap();
+    assert_eq!(&entry.body[..], b"<Report>updated</Report>");
+}
+
+#[tokio::test]
+async fn last_modified_is_monotonic_under_out_of_order_updated() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(dmdata_event(
+        "t-late",
+        meta("id-late", "後発", "2026-07-05T04:20:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let snapshot1 = state.feed.load_full();
+    let lm1 = snapshot1.last_modified.expect("last_modified must be set");
+    let etag1 = snapshot1.etag.clone();
+
+    // より古いupdatedのイベント(訂正報のReportDateTime逆順を模擬)が先頭に来ても
+    // Last-Modified は後退しない
+    tx.send(dmdata_event(
+        "t-early",
+        meta("id-early", "先発(遅延受信)", "2026-07-05T04:15:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    assert!(body.contains("id-early"));
+
+    let snapshot2 = state.feed.load_full();
+    let lm2 = snapshot2.last_modified.expect("last_modified must be set");
+    assert_eq!(lm2, lm1, "last_modified must not regress");
+    // feed本文の<updated>は従来どおり先頭entryの値(=古い方)のまま
+    assert_eq!(snapshot2.last_updated, "2026-07-05T04:15:00+09:00");
+    // HTTP用文字列も事前計算されている
+    assert_eq!(
+        snapshot2.last_modified_http.as_deref(),
+        Some("Sat, 04 Jul 2026 19:20:00 GMT")
+    );
 }
