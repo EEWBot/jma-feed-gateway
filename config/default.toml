@@ -25,10 +25,13 @@ retry_initial_backoff_ms = 1000
 
 [dmdata]
 api_base = "https://api.dmdata.jp/v2"
-ws_endpoints = [
-    "wss://ws-tokyo.api.dmdata.jp/v2/websocket",
-    "wss://ws-osaka.api.dmdata.jp/v2/websocket",
-]
+# WebSocketエンドポイント。契約で複数本張れる場合のみ tokyo/osaka の2本を列挙する。
+ws_endpoints = ["wss://ws.api.dmdata.jp/v2/websocket"]
+# 2本張れる契約の例:
+# ws_endpoints = [
+#     "wss://ws-tokyo.api.dmdata.jp/v2/websocket",
+#     "wss://ws-osaka.api.dmdata.jp/v2/websocket",
+# ]
 classifications = ["telegram.earthquake"]
 # DMDATAサーバー側の電文type絞り込み(これはDMDATAサーバー側フィルター)。
 # `types = []` にすると従来どおり全typeを受信する。

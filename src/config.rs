@@ -179,7 +179,11 @@ mod tests {
             assert_eq!(config.jma.telegram_types.len(), 15);
             assert!(config.jma.telegram_types.iter().any(|t| t == "VXSE53"));
             assert_eq!(config.dmdata.types, config.jma.telegram_types);
-            assert_eq!(config.dmdata.ws_endpoints.len(), 2);
+            assert_eq!(config.dmdata.ws_endpoints.len(), 1);
+            assert_eq!(
+                config.dmdata.ws_endpoints[0],
+                "wss://ws.api.dmdata.jp/v2/websocket"
+            );
             assert_eq!(config.dmdata.classifications, vec!["telegram.earthquake"]);
             assert!(config.dmdata.api_key.is_none());
             Ok(())

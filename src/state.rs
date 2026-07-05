@@ -12,15 +12,24 @@ use crate::config::Config;
 use crate::types::{EntityEntry, Event, FeedSnapshot};
 
 /// readiness 状態。Ordering は Relaxed で十分(単なるフラグ)。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Readiness {
     pub initial_feed_loaded: AtomicBool,
     pub aggregator_running: AtomicBool,
-    /// WS接続状態(0=tokyo, 1=osaka)。
-    pub ws_connected: [AtomicBool; 2],
+    /// WS接続状態。要素数は設定した ws_endpoints の本数(1〜2)と一致する。
+    pub ws_connected: Box<[AtomicBool]>,
 }
 
 impl Readiness {
+    /// WS接続本数を指定して構築する。
+    pub fn new(ws_count: usize) -> Self {
+        Self {
+            initial_feed_loaded: AtomicBool::new(false),
+            aggregator_running: AtomicBool::new(false),
+            ws_connected: (0..ws_count).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
     /// ready = 初期一覧取得済み && aggregator稼働中 && WSがいずれか接続中。
     pub fn is_ready(&self) -> bool {
         self.initial_feed_loaded.load(Ordering::Relaxed)
@@ -32,19 +41,20 @@ impl Readiness {
         ReadinessSnapshot {
             feed: self.initial_feed_loaded.load(Ordering::Relaxed),
             aggregator: self.aggregator_running.load(Ordering::Relaxed),
-            ws: [
-                self.ws_connected[0].load(Ordering::Relaxed),
-                self.ws_connected[1].load(Ordering::Relaxed),
-            ],
+            ws: self
+                .ws_connected
+                .iter()
+                .map(|b| b.load(Ordering::Relaxed))
+                .collect(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadinessSnapshot {
     pub feed: bool,
     pub aggregator: bool,
-    pub ws: [bool; 2],
+    pub ws: Vec<bool>,
 }
 
 pub struct AppState {
@@ -86,13 +96,14 @@ impl AppState {
         let started_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339 formatting cannot fail");
+        let readiness = Readiness::new(config.dmdata.ws_endpoints.len());
         Self {
             config,
             feed: ArcSwap::from_pointee(FeedSnapshot::empty()),
             entities,
             pinned: DashMap::new(),
             inflight: DashMap::new(),
-            readiness: Readiness::default(),
+            readiness,
             client,
             event_tx,
             started_at,

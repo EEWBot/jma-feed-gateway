@@ -250,7 +250,7 @@ async fn readyz_503_then_200() {
     let body = body_bytes(response).await;
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["feed"], false);
-    assert_eq!(json["ws"], serde_json::json!([false, false]));
+    assert_eq!(json["ws"], serde_json::json!([false]));
 
     state
         .readiness
@@ -267,14 +267,14 @@ async fn readyz_503_then_200() {
         "ws not connected yet"
     );
 
-    state.readiness.ws_connected[1].store(true, Ordering::Relaxed);
+    state.readiness.ws_connected[0].store(true, Ordering::Relaxed);
     let response = get(&router, "/readyz", None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["feed"], true);
     assert_eq!(json["aggregator"], true);
-    assert_eq!(json["ws"], serde_json::json!([false, true]));
+    assert_eq!(json["ws"], serde_json::json!([true]));
 }
 
 #[tokio::test]
