@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "error": "Duplicate connection",
+  "code": 4103,
+  "close": true
+}

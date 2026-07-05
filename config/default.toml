@@ -1,0 +1,42 @@
+# jma-relay デフォルト設定。
+# 全ての値は環境変数 `JMA_RELAY__<SECTION>__<KEY>`(区切りは `__`)で上書き可能。
+# 例: JMA_RELAY__HTTP__BIND_ADDR=0.0.0.0:9000
+# 秘密情報(dmdata.api_key)は環境変数 JMA_RELAY__DMDATA__API_KEY で設定すること。
+
+[http]
+bind_addr = "127.0.0.1:8080"
+# 生成するAtomフィードの entry id / link に使う自サーバの公開URL
+public_base_url = "http://127.0.0.1:8080"
+
+[jma]
+feed_url = "https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml"
+data_base_url = "https://www.data.jma.go.jp/developer/xml/data"
+fetch_timeout_secs = 30
+retry_attempts = 5
+retry_initial_backoff_ms = 1000
+
+[dmdata]
+api_base = "https://api.dmdata.jp/v2"
+ws_endpoints = [
+    "wss://ws-tokyo.api.dmdata.jp/v2/websocket",
+    "wss://ws-osaka.api.dmdata.jp/v2/websocket",
+]
+classifications = ["telegram.earthquake"]
+types = []
+app_name = "jma-relay"
+cleanup_stale_sockets = true
+
+[dmdata.reconnect]
+initial_secs = 1
+max_secs = 60
+multiplier = 2.0
+
+[cache]
+# Atomフィードに保持する最大entry数
+feed_entries = 100
+# 実体XMLキャッシュの最大件数
+entity_capacity = 1024
+# 実体XMLキャッシュのTTL(秒)。一覧保持期間より十分長くすること(合成ID対策)
+entity_ttl_secs = 86400
+# dedup(seen)キャッシュのTTL(秒)
+seen_ttl_secs = 3600

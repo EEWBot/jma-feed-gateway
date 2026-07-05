@@ -1,0 +1,43 @@
+{
+  "type": "data",
+  "version": "2.0",
+  "classification": "telegram.earthquake",
+  "id": "TELEGRAM_ID_1",
+  "passing": [
+    {"name": "socket", "time": "2026-07-05T04:10:04.000Z"},
+    {"name": "websocket", "time": "2026-07-05T04:10:05.000Z"}
+  ],
+  "head": {
+    "type": "VXSE53",
+    "author": "JPOS",
+    "target": "",
+    "time": "2026-07-05T04:10:05.000Z",
+    "designation": null,
+    "test": false,
+    "xml": true
+  },
+  "xmlReport": {
+    "control": {
+      "title": "震源・震度に関する情報",
+      "dateTime": "2026-07-04T19:10:00Z",
+      "status": "通常",
+      "editorialOffice": "気象庁本庁",
+      "publishingOffice": "気象庁"
+    },
+    "head": {
+      "title": "震源・震度情報",
+      "reportDateTime": "2026-07-05T04:10:00+09:00",
+      "targetDateTime": "2026-07-05T04:05:00+09:00",
+      "eventId": "20260705040500",
+      "serial": "2",
+      "infoType": "発表",
+      "infoKind": "震源・震度編集",
+      "infoKindVersion": "1.0",
+      "headline": "5日04時05分ころ、地震がありました。"
+    }
+  },
+  "format": "xml",
+  "compression": null,
+  "encoding": null,
+  "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Report xmlns=\"http://xml.kishou.go.jp/jmaxml1/\">\n<Control>\n<Title>震源・震度に関する情報</Title>\n<DateTime>2026-07-04T19:10:00Z</DateTime>\n<Status>通常</Status>\n<EditorialOffice>気象庁本庁</EditorialOffice>\n<PublishingOffice>気象庁</PublishingOffice>\n</Control>\n<Head xmlns=\"http://xml.kishou.go.jp/jmaxml1/informationBasis1/\">\n<Title>震源・震度情報</Title>\n<ReportDateTime>2026-07-05T04:10:00+09:00</ReportDateTime>\n<TargetDateTime>2026-07-05T04:05:00+09:00</TargetDateTime>\n<EventID>20260705040500</EventID>\n<InfoType>発表</InfoType>\n<Serial>2</Serial>\n<InfoKind>震源・震度編集</InfoKind>\n<InfoKindVersion>1.0</InfoKindVersion>\n<Headline>\n<Text>5日04時05分ころ、地震がありました。</Text>\n</Headline>\n</Head>\n<Body/>\n</Report>\n"
+}

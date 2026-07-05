@@ -1,0 +1,10 @@
+{
+  "type": "start",
+  "socketId": 12345,
+  "classifications": ["telegram.earthquake"],
+  "types": ["VXSE51", "VXSE52", "VXSE53"],
+  "test": "no",
+  "formats": ["xml"],
+  "appName": "jma-relay-1",
+  "time": "2026-07-05T04:00:00.000Z"
+}
