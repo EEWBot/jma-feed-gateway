@@ -1,12 +1,15 @@
 //! HTTPハンドラ。ここではXML生成もキャッシュ書き込みも行わない。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
+use dashmap::mapref::entry::Entry;
+use tokio::sync::watch;
 
 use crate::fetcher;
 use crate::http::etag;
@@ -135,18 +138,37 @@ pub async fn data(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // singleflight: 先着のみバックグラウンド取得を起動し、全員に307を即返す
-    if state.inflight.insert(id.to_owned(), ()).is_none() {
-        tokio::spawn(fetcher::fetch_entity(state.clone(), id.to_owned()));
-    }
+    // singleflight: 先着のみ取得を起動し、全員が同じ watch で完成entryを待つ。
+    // DashMapのentry guardを .await 跨ぎで持たないよう、match式でrxをcloneして抜ける。
+    let mut rx = match state.inflight.entry(id.to_owned()) {
+        Entry::Occupied(occupied) => occupied.get().clone(),
+        Entry::Vacant(vacant) => {
+            let (tx, rx) = watch::channel(None);
+            vacant.insert(rx.clone());
+            tokio::spawn(fetcher::fetch_entity(state.clone(), id.to_owned(), tx));
+            rx
+        }
+    };
 
-    let location = format!(
-        "{}/{}.xml",
-        state.config.jma.data_base_url.trim_end_matches('/'),
-        id
-    );
-    // Redirect::temporary = 307(Redirect::to は303なので不可)
-    Redirect::temporary(&location).into_response()
+    // 待機予算 = クライアント全体タイムアウト + 余裕1秒(fetchはこれを超えられない)
+    let wait = Duration::from_secs(state.config.jma.fetch_timeout_secs + 1);
+    let entry = match tokio::time::timeout(wait, rx.wait_for(|v| v.is_some())).await {
+        Ok(Ok(value)) => value.as_ref().cloned(),
+        // タイムアウト or Sender drop(取得失敗)
+        _ => None,
+    };
+    match entry {
+        Some(entry) => serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE),
+        None => {
+            // フォールバック: 従来どおり上流へ307(Redirect::to は303なので不可)
+            let location = format!(
+                "{}/{}.xml",
+                state.config.jma.data_base_url.trim_end_matches('/'),
+                id
+            );
+            Redirect::temporary(&location).into_response()
+        }
+    }
 }
 
 /// GET /healthz — 常時200。

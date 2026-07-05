@@ -112,6 +112,17 @@ fn header_str<'a>(response: &'a axum::response::Response, name: &str) -> Option<
     response.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
+/// inflight ガードの解除を待つ(fetch_entity の完了はレスポンスより僅かに遅れうる)。
+async fn wait_inflight_empty(state: &SharedState) {
+    for _ in 0..100 {
+        if state.inflight.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("inflight guard must be removed");
+}
+
 #[tokio::test]
 async fn feed_200_then_304() {
     let (_state, router) = setup().await;
@@ -202,29 +213,49 @@ async fn data_non_jma_id_miss_returns_404() {
 }
 
 #[tokio::test]
-async fn data_jma_style_id_miss_returns_307() {
-    // 実JMAフィードのID形式(datetime_serial_TYPE_officecode)はミス時に上流へ307
-    let (state, router) = setup().await;
+async fn data_jma_id_miss_holds_and_serves_200() {
+    // 実JMAフィードのID形式のミスはレスポンスを保留し、取得完了後に200で返す
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{JMA_MISS}.xml")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<Report>held entity</Report>", "application/xml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.jma.data_base_url = mock_server.uri();
+    });
+    // 待機者はwatch経由で直接entryを受け取るため、aggregatorなしでも200になる
+    std::mem::forget(rx);
+    let router = build_router(state.clone());
+
     let response = get(
         &router,
-        "/developer/xml/data/20260705050045_0_VFVO53_010000.xml",
+        &format!("/developer/xml/data/{JMA_MISS}.xml"),
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = response
-        .headers()
-        .get(header::LOCATION)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(
-        location,
-        format!(
-            "{}/20260705050045_0_VFVO53_010000.xml",
-            state.config.jma.data_base_url.trim_end_matches('/')
-        )
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        header_str(&response, "etag").is_some_and(|e| e.starts_with('"')),
+        "ETag must be present"
     );
+    assert!(
+        response.headers().get(header::LOCATION).is_none(),
+        "200 must not carry Location"
+    );
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], b"<Report>held entity</Report>");
+
+    // fetch_entityの完了(InflightGuard解除)はレスポンスより僅かに遅れうるため待つ
+    wait_inflight_empty(&state).await;
 }
 
 #[tokio::test]
@@ -308,14 +339,25 @@ async fn singleflight_hits_upstream_once() {
     }
     let router = build_router(state.clone());
 
-    // 並行32リクエスト → 全員 307、上流ヒットは先着の1回のみ
+    // 並行32リクエスト → 全員が同じwatchで待機し、完成entryを200で受け取る。
+    // 上流ヒットは先着の1回のみ
     let uri = format!("/developer/xml/data/{JMA_MISS}.xml");
     let futures: Vec<_> = (0..32).map(|_| get(&router, &uri, None)).collect();
+    let mut first_etag: Option<String> = None;
     for response in futures_util::future::join_all(futures).await {
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = header_str(&response, "etag")
+            .expect("ETag must be present")
+            .to_owned();
+        match &first_etag {
+            Some(expected) => assert_eq!(&etag, expected, "all waiters must share one ETag"),
+            None => first_etag = Some(etag),
+        }
+        let body = body_bytes(response).await;
+        assert_eq!(&body[..], b"<Report>fetched entity</Report>");
     }
 
-    // バックグラウンド取得の完了(キャッシュ格納 + inflight解除)を待つ
+    // 取得完了後の後処理(キャッシュ格納 + inflight解除)を待つ
     let mut cached = None;
     for _ in 0..100 {
         if let Some(entry) = state.entities.get(JMA_MISS).await {
@@ -324,15 +366,92 @@ async fn singleflight_hits_upstream_once() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let entry = cached.expect("entity must be cached after background fetch");
+    let entry = cached.expect("entity must be cached after fetch");
     assert_eq!(&entry.body[..], b"<Report>fetched entity</Report>");
-    assert!(state.inflight.is_empty(), "inflight guard must be removed");
+    wait_inflight_empty(&state).await;
 
     // キャッシュ済みなので次は200
     let response = get(&router, &uri, None).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     // MockServer drop 時に expect(1) が検証される
+}
+
+#[tokio::test]
+async fn data_miss_upstream_error_falls_back_to_307() {
+    // 上流が5xxで取得失敗(Sender drop)した場合は従来どおり307へフォールバック
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{JMA_MISS}.xml")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.jma.data_base_url = mock_server.uri();
+    });
+    std::mem::forget(rx);
+    let router = build_router(state.clone());
+
+    let response = get(
+        &router,
+        &format!("/developer/xml/data/{JMA_MISS}.xml"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(location, format!("{}/{JMA_MISS}.xml", mock_server.uri()));
+    wait_inflight_empty(&state).await;
+}
+
+#[tokio::test]
+async fn data_miss_fetch_timeout_falls_back_to_307() {
+    // 上流応答が待機予算(fetch_timeout_secs + 1秒)を超える場合は307へフォールバック
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{JMA_MISS}.xml")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<Report>too late</Report>", "application/xml")
+                // 待機予算(0 + 1秒)を確実に超える遅延
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.jma.data_base_url = mock_server.uri();
+        c.jma.fetch_timeout_secs = 0;
+    });
+    std::mem::forget(rx);
+    let router = build_router(state.clone());
+
+    let response = get(
+        &router,
+        &format!("/developer/xml/data/{JMA_MISS}.xml"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(location, format!("{}/{JMA_MISS}.xml", mock_server.uri()));
 }
 
 #[tokio::test]
@@ -353,7 +472,9 @@ async fn data_served_from_pinned_with_etag_roundtrip() {
     let uri = "/developer/xml/data/TELEGRAM_ID_PINNED.xml";
     let response = get(&router, uri, None).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let etag = header_str(&response, "etag").expect("ETag must be present").to_owned();
+    let etag = header_str(&response, "etag")
+        .expect("ETag must be present")
+        .to_owned();
     assert!(etag.starts_with('"'));
     let body = body_bytes(response).await;
     assert_eq!(&body[..], b"<Report>pinned entity</Report>");

@@ -122,9 +122,11 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         (a, b) => a.or(b),
     };
 
-    state
-        .feed
-        .store(Arc::new(FeedSnapshot::new(body, last_updated, last_modified)));
+    state.feed.store(Arc::new(FeedSnapshot::new(
+        body,
+        last_updated,
+        last_modified,
+    )));
 }
 
 #[cfg(test)]

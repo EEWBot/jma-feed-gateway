@@ -289,7 +289,10 @@ async fn trim_demotes_pinned_entry_to_entities() {
     }
 
     // feedから溢れたid-1はpinnedから外れ、entities(moka)へ降格して配信継続
-    assert!(state.pinned.get("id-1").is_none(), "evicted entry must be unpinned");
+    assert!(
+        state.pinned.get("id-1").is_none(),
+        "evicted entry must be unpinned"
+    );
     let entry = state
         .entities
         .get("id-1")
@@ -307,8 +310,16 @@ async fn warmup_entries_are_never_pinned() {
     // ウォームアップ(初期一覧)のmetaは実体を持たずpinnedに載らない。
     // trimで溢れても何も起きない(上流307でカバー)
     let initial = vec![
-        meta("20260705040000_0_VXSE53_A", "warmup-1", "2026-07-05T04:00:00+09:00"),
-        meta("20260705035900_0_VXSE53_B", "warmup-2", "2026-07-05T03:59:00+09:00"),
+        meta(
+            "20260705040000_0_VXSE53_A",
+            "warmup-1",
+            "2026-07-05T04:00:00+09:00",
+        ),
+        meta(
+            "20260705035900_0_VXSE53_B",
+            "warmup-2",
+            "2026-07-05T03:59:00+09:00",
+        ),
     ];
     let (state, tx) = setup(2, initial).await;
     assert!(state.pinned.is_empty(), "warmup metas must not be pinned");
@@ -325,7 +336,13 @@ async fn warmup_entries_are_never_pinned() {
 
     // 溢れたウォームアップ由来IDはpinnedにもentitiesにも入らない
     assert!(state.pinned.get("20260705035900_0_VXSE53_B").is_none());
-    assert!(state.entities.get("20260705035900_0_VXSE53_B").await.is_none());
+    assert!(
+        state
+            .entities
+            .get("20260705035900_0_VXSE53_B")
+            .await
+            .is_none()
+    );
     // 新着のみピン済み
     assert_eq!(state.pinned.len(), 1);
     assert!(state.pinned.get("id-new").is_some());

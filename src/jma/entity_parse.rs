@@ -50,7 +50,10 @@ pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
                 buf.clear();
             }
             XmlEvent::Text(e) => {
-                buf.push_str(&e.decode().map_err(|e| UpstreamError::Parse(e.to_string()))?);
+                buf.push_str(
+                    &e.decode()
+                        .map_err(|e| UpstreamError::Parse(e.to_string()))?,
+                );
             }
             XmlEvent::GeneralRef(e) => {
                 buf.push_str(&resolve_entity_ref(&e)?);

@@ -24,9 +24,7 @@ pub fn telegram_type(id: &str) -> Option<&str> {
 /// dataハンドラでミス時に上流JMAへ307してよいかのゲートに使う。
 pub fn is_jma_id(id: &str) -> bool {
     let bytes = id.as_bytes();
-    bytes.len() > 15
-        && bytes[..14].iter().all(u8::is_ascii_digit)
-        && bytes[14] == b'_'
+    bytes.len() > 15 && bytes[..14].iter().all(u8::is_ascii_digit) && bytes[14] == b'_'
 }
 
 /// DMDATA電文IDが空の場合のフォールバック。決定的な合成IDを生成する。

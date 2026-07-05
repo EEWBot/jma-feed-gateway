@@ -1,7 +1,7 @@
 //! JMA Atomフィード(eqvol.xml)のパース → `Vec<ItemMeta>`(純粋関数)。
 
-use quick_xml::XmlVersion;
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::Event as XmlEvent;
 
 use crate::error::UpstreamError;
@@ -73,7 +73,10 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
             }
             XmlEvent::Text(e) => {
                 if field.is_some() {
-                    text.push_str(&e.decode().map_err(|e| UpstreamError::Parse(e.to_string()))?);
+                    text.push_str(
+                        &e.decode()
+                            .map_err(|e| UpstreamError::Parse(e.to_string()))?,
+                    );
                 }
             }
             XmlEvent::GeneralRef(e) => {

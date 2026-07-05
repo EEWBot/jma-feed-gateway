@@ -16,7 +16,9 @@ use crate::error::UpstreamError;
 /// `Event::GeneralRef` として届く。イベントは実体名(`amp` 等)のみを持つため、
 /// `&name;` に再構成して解決する。名前付き実体と数値文字参照の双方に対応。
 pub(crate) fn resolve_entity_ref(e: &BytesRef) -> Result<String, UpstreamError> {
-    let name = e.decode().map_err(|e| UpstreamError::Parse(e.to_string()))?;
+    let name = e
+        .decode()
+        .map_err(|e| UpstreamError::Parse(e.to_string()))?;
     let raw = format!("&{name};");
     let resolved = unescape(&raw).map_err(|e| UpstreamError::Parse(e.to_string()))?;
     Ok(resolved.into_owned())

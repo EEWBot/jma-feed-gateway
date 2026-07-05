@@ -6,10 +6,15 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
 use crate::types::{EntityEntry, Event, FeedSnapshot};
+
+/// キャッシュミス待機者へ完成entryを配るwatch。None=取得中、Some=完成。
+/// Sender drop(None のまま)=取得失敗のシグナル。
+pub type InflightRx = watch::Receiver<Option<Arc<EntityEntry>>>;
+pub type InflightTx = watch::Sender<Option<Arc<EntityEntry>>>;
 
 /// readiness 状態。Ordering は Relaxed で十分(単なるフラグ)。
 #[derive(Debug)]
@@ -70,8 +75,10 @@ pub struct AppState {
     /// 上限は feed_entries(100件・数MB)に自然に抑えられる。
     /// 再起動後は pinned 空 + feedはJMAウォームアップIDのみで整合。
     pub pinned: DashMap<String, Arc<EntityEntry>>,
-    /// singleflight 用の先着ガード。fetch 完了/失敗時に必ず remove すること。
-    pub inflight: DashMap<String, ()>,
+    /// singleflight 用の先着ガード + 待機者への配布口。
+    /// fetch側は完成entryをsendするか、失敗時はSenderをdropする。
+    /// InflightGuard により完了/失敗いずれでも必ずキーがremoveされる。
+    pub inflight: DashMap<String, InflightRx>,
     pub readiness: Readiness,
     pub client: reqwest::Client,
     /// aggregator への Event 送信口。fetch_entity はこれ経由で送る(single-writer 維持)。

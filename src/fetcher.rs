@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::error::UpstreamError;
 use crate::jma::{entity_parse, feed_parse};
-use crate::state::SharedState;
-use crate::types::{DedupKey, Event, EventSource, ItemMeta};
+use crate::state::{InflightTx, SharedState};
+use crate::types::{DedupKey, EntityEntry, Event, EventSource, ItemMeta};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -143,14 +143,16 @@ impl Drop for InflightGuard {
     }
 }
 
-/// キャッシュミスした実体XMLをJMAからバックグラウンド取得する。
-/// 呼び出し側(dataハンドラ)が `state.inflight.insert(id, ())` で先着ガードを
-/// 取得済みであることが前提。完了・失敗いずれでも必ずガードを解除する。
+/// キャッシュミスした実体XMLをJMAから取得する。
+/// 呼び出し側(dataハンドラ)が `state.inflight` に watch Receiver を登録して
+/// 先着ガードを取得済みであることが前提。完了・失敗いずれでも必ずガードを解除する。
 ///
+/// 成功時は完成entryを `result_tx` でsendし、待機中のハンドラへ直接配る。
+/// 失敗時はsendせずreturnし、Sender dropが失敗シグナルとなる。
 /// 取得結果は直接mokaに入れず、メタ抽出(Control/Head)のうえ
 /// `Event { source: JmaFeed, .. }` として mpsc で aggregator へ送る(single-writer 維持)。
 /// JmaFeed 由来のEventは entities 挿入のみで一覧は再生成されない。
-pub async fn fetch_entity(state: SharedState, id: String) {
+pub async fn fetch_entity(state: SharedState, id: String, result_tx: InflightTx) {
     let _guard = InflightGuard {
         state: state.clone(),
         id: id.clone(),
@@ -183,6 +185,11 @@ pub async fn fetch_entity(state: SharedState, id: String) {
         content: entity_meta.headline_text,
         link: url,
     };
+
+    // 待機中のハンドラへ完成entryを即配布する(Bytes cloneは安価)。
+    // mokaへの格納は従来どおりEvent経由でaggregatorが行う(single-writer維持)
+    let entry = std::sync::Arc::new(EntityEntry::new(body.clone(), meta.clone()));
+    let _ = result_tx.send(Some(entry)); // 待機者ゼロなら送信失敗でよい
 
     let event = Event {
         source: EventSource::JmaFeed,
