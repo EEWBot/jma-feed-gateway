@@ -14,7 +14,7 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 flate2 = "1.1.9"
 futures-util = "0.3.32"
 moka = { version = "0.12", features = ["future", "sync"] }
-quick-xml = "0.37"
+quick-xml = "0.41"
 rand = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
