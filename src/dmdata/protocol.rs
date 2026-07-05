@@ -47,6 +47,7 @@ pub struct WsPing {
 pub struct WsPong {
     #[serde(rename = "type")]
     pub message_type: PongType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ping_id: Option<String>,
 }
 
@@ -212,6 +213,18 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&pong).unwrap();
         assert_eq!(value["type"], "pong");
         assert_eq!(value["pingId"], "nBglV1");
+    }
+
+    #[test]
+    fn pong_omits_ping_id_when_ping_has_none() {
+        let msg: WsMessage = serde_json::from_str(r#"{"type":"ping"}"#).expect("ping must parse");
+        let WsMessage::Ping(ping) = msg else {
+            panic!("expected ping");
+        };
+        assert!(ping.ping_id.is_none());
+
+        let pong = WsPong::reply_to(&ping).to_json();
+        assert_eq!(pong, r#"{"type":"pong"}"#);
     }
 
     #[test]
