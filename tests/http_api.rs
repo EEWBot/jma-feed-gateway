@@ -172,15 +172,29 @@ async fn data_miss_returns_307_to_upstream() {
 }
 
 #[tokio::test]
-async fn data_synthetic_id_miss_returns_404() {
-    let (_state, router) = setup().await;
+async fn data_jma_style_id_miss_returns_307() {
+    // 実JMAフィードのID形式(datetime_serial_TYPE_officecode)はミス時に上流へ307
+    let (state, router) = setup().await;
     let response = get(
         &router,
-        "/developer/xml/data/20260705041000_2_VXSE53_20260705041000.xml",
+        "/developer/xml/data/20260705050045_0_VFVO53_010000.xml",
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        location,
+        format!(
+            "{}/20260705050045_0_VFVO53_010000.xml",
+            state.config.jma.data_base_url.trim_end_matches('/')
+        )
+    );
 }
 
 #[tokio::test]

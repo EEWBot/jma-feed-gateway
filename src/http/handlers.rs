@@ -7,7 +7,6 @@ use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
 
 use crate::http::etag;
-use crate::jma::id::is_synthetic;
 use crate::state::SharedState;
 use crate::fetcher;
 
@@ -61,11 +60,9 @@ pub async fn data(
         return serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE);
     }
 
-    // 合成IDはJMA本家に存在しないため307せず404
-    if is_synthetic(id) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
+    // ミスは常に307。JMAの実IDは `{yyyyMMddHHmmss}_{serial}_{TYPE}_{code}` 形式で
+    // 上流に存在する。DMDATA由来の合成IDは上流に存在しない可能性があるが、
+    // その場合は上流が404を返すのに任せる(キャッシュ在庫中はここに来ない)。
     // singleflight: 先着のみバックグラウンド取得を起動し、全員に307を即返す
     if state.inflight.insert(id.to_owned(), ()).is_none() {
         tokio::spawn(fetcher::fetch_entity(state.clone(), id.to_owned()));
