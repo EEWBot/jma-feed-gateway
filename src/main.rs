@@ -4,8 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use time::UtcOffset;
+use time::macros::format_description;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::OffsetTime;
 
 use jma_feed_gateway::config::Config;
 use jma_feed_gateway::error::AppError;
@@ -15,7 +18,14 @@ use jma_feed_gateway::{aggregator, dmdata, fetcher, http, poller};
 
 #[tokio::main]
 async fn main() {
+    let jst = UtcOffset::from_hms(9, 0, 0).expect("valid JST offset");
+    let timer = OffsetTime::new(
+        jst,
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+    );
+
     tracing_subscriber::fmt()
+        .with_timer(timer)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
