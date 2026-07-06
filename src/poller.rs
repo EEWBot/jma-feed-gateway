@@ -7,7 +7,14 @@
 //! 不変条件:
 //! - `last_modified` は前回200の `Last-Modified` ヘッダ生値をそのまま保持し、
 //!   再フォーマットせずに `If-Modified-Since` へ返す(クロックスキュー免疫)。
-//! - entry の実体fetchに失敗した場合は `seen_ids` へ登録しない(次分リトライ)。
+//! - fetch失敗・上限超過で未処理のentryは `pending` に保持し(seen未登録)、
+//!   次tickでwatermark再選別を**通さず**処理する。watermarkは新しい項目の
+//!   publishで前進するため、再選別に通すと古い持ち越し分が既配信扱いで
+//!   永久に失われる。
+//! - `last_modified` のコミットは `pending` が空になったtickのみ。未処理を
+//!   残したままコミットすると次tickが304になり再試行の機会を失う。
+//! - 上流フィードの一覧から消えたpendingは破棄する(滞留の自然な上限)。
+//! - WS復帰後もpendingは処理し切る(WSは切断中に発行された電文を再配信しない)。
 //! - WS復帰後にWSから届く重複電文は aggregator の本文ハッシュdedupeがdropする。
 
 use std::sync::atomic::Ordering;
@@ -41,6 +48,9 @@ pub struct Poller {
     last_modified: Option<String>,
     /// 処理済みJMAフィードentry ID(TTLは `cache.seen_ttl_secs` を流用)。
     seen_ids: moka::sync::Cache<String, ()>,
+    /// 未処理の持ち越しentry(fetch失敗・entry_fetch_limit超過)。updated昇順。
+    /// watermark再選別を通さずに次tickで処理する。
+    pending: Vec<ItemMeta>,
     /// 遷移ログ用: 直前tickでpolling稼働していたか。
     was_polling: bool,
 }
@@ -56,6 +66,7 @@ impl Poller {
             state,
             last_modified: None,
             seen_ids,
+            pending: Vec::new(),
             was_polling: false,
         }
     }
@@ -91,40 +102,87 @@ impl Poller {
             request = request.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
         let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            tracing::debug!("poll: feed not modified");
-            return Ok(PollOutcome::NotModified);
-        }
-        if !response.status().is_success() {
-            return Err(UpstreamError::Status(response.status()));
-        }
-        // ヘッダ無しの200では旧値を維持する
-        if let Some(lm) = response
-            .headers()
-            .get(reqwest::header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-        {
-            self.last_modified = Some(lm.to_string());
+        let status = response.status();
+
+        // Last-Modifiedはここではコミットしない。未処理(pending)が残った場合、
+        // 次tickも200で全量を取り直して再試行する必要がある
+        // (先にコミットすると次tickが304になり、失敗分がフィード更新まで宙に浮く)
+        let mut latest_last_modified: Option<String> = None;
+
+        let mut candidates: Vec<ItemMeta>;
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            if self.pending.is_empty() {
+                tracing::debug!("poll: feed not modified");
+                return Ok(PollOutcome::NotModified);
+            }
+            // フィード未更新でも持ち越し分は処理する
+            candidates = std::mem::take(&mut self.pending);
+        } else {
+            if !status.is_success() {
+                return Err(UpstreamError::Status(status));
+            }
+            latest_last_modified = response
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+
+            let body = response.text().await?;
+            let items = feed_parse::parse(&body)?;
+            let items = fetcher::filter_by_types(items, &config.jma.telegram_types);
+
+            // 上流フィードの一覧から消えたpendingは破棄(滞留の自然な上限)
+            self.pending.retain(|p| items.iter().any(|m| m.id == p.id));
+            // pending済みIDはfetch対象と確定済み — watermark再選別を通さない。
+            // watermarkは新項目のpublishで前進するため、再選別に通すと古い
+            // 持ち越し分が既配信扱いになり永久に失われる
+            let items: Vec<ItemMeta> = items
+                .into_iter()
+                .filter(|m| self.pending.iter().all(|p| p.id != m.id))
+                .collect();
+
+            // watermark: aggregatorが単調clamp済みのフィードLast-Modified
+            let watermark = self.state.feed.load().last_modified;
+            let slack = Duration::from_secs(config.poll.watermark_slack_secs);
+            let new_candidates = select_candidates(items, watermark, slack, &self.seen_ids);
+
+            candidates = std::mem::take(&mut self.pending);
+            candidates.extend(new_candidates);
+            // JMAのupdatedは+09:00固定のRFC3339なので辞書順比較=時系列比較
+            candidates.sort_by(|a, b| a.updated.cmp(&b.updated));
         }
 
-        let body = response.text().await?;
-        let items = feed_parse::parse(&body)?;
-        let items = fetcher::filter_by_types(items, &config.jma.telegram_types);
-
-        // watermark: aggregatorが単調clamp済みのフィードLast-Modified
-        let watermark = self.state.feed.load().last_modified;
-        let slack = Duration::from_secs(config.poll.watermark_slack_secs);
-        let mut candidates = select_candidates(items, watermark, slack, &self.seen_ids);
-
-        // バースト保護: 最新 entry_fetch_limit 件を残す(古い側はseen未登録のまま
-        // 次分以降に持ち越し)
-        if candidates.len() > config.poll.entry_fetch_limit {
-            let deferred = candidates.len() - config.poll.entry_fetch_limit;
+        // バースト保護: 最新 entry_fetch_limit 件を処理し、古い側はpendingへ戻す
+        let deferred = candidates
+            .len()
+            .saturating_sub(config.poll.entry_fetch_limit);
+        if deferred > 0 {
             tracing::warn!(deferred, "poll candidates exceed entry_fetch_limit");
-            candidates.drain(..deferred);
+            self.pending.extend(candidates.drain(..deferred));
         }
 
-        // 昇順にpublishする(feed先頭が最新になり、容量evictionが最古から落ちる)
+        let published = self.publish_candidates(candidates).await;
+
+        // 未処理(失敗・持ち越し)ゼロのtickのみLast-Modifiedをコミットする
+        // (ヘッダ無しの200では旧値を維持)
+        if self.pending.is_empty()
+            && let Some(lm) = latest_last_modified
+        {
+            self.last_modified = Some(lm);
+        }
+
+        tracing::info!(
+            published,
+            pending = self.pending.len(),
+            "poll tick completed"
+        );
+        Ok(PollOutcome::Published(published))
+    }
+
+    /// 候補(updated昇順)を実体fetch→publishする。fetch失敗分は `pending` へ
+    /// 戻す(seen未登録)。publish件数を返す。
+    async fn publish_candidates(&mut self, candidates: Vec<ItemMeta>) -> usize {
+        let config = self.state.config.clone();
         let mut published = 0usize;
         for meta in candidates {
             let url = if meta.link.is_empty() {
@@ -139,8 +197,9 @@ impl Poller {
             let body = match fetcher::fetch_bytes(&self.state.client, &url).await {
                 Ok(body) => body,
                 Err(e) => {
-                    // seen登録しない → 次分リトライ
+                    // seen登録せずpendingへ → 次tickでwatermark再選別を通さずリトライ
                     tracing::warn!(error = %e, id = %meta.id, "poll entry fetch failed");
+                    self.pending.push(meta);
                     continue;
                 }
             };
@@ -152,15 +211,37 @@ impl Poller {
                 meta,
             };
             if self.state.event_tx.send(event).await.is_err() {
+                // runが次tickの is_closed チェックで終了する
                 tracing::warn!("aggregator channel closed; polled entry dropped");
-                break;
+                return published;
             }
             self.seen_ids.insert(id, ());
             published += 1;
         }
+        published
+    }
 
-        tracing::info!(published, "poll tick completed");
-        Ok(PollOutcome::Published(published))
+    /// poll対象外のtick(WS復帰後)で持ち越し分のみ処理する。
+    /// WSは切断中に発行された電文を再配信しないため、pendingを放置すると
+    /// その電文は次のアウトエージまで(フィード保持期間を過ぎれば永久に)失われる。
+    #[doc(hidden)]
+    pub async fn drain_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut candidates = std::mem::take(&mut self.pending);
+        let deferred = candidates
+            .len()
+            .saturating_sub(self.state.config.poll.entry_fetch_limit);
+        if deferred > 0 {
+            self.pending.extend(candidates.drain(..deferred));
+        }
+        let published = self.publish_candidates(candidates).await;
+        tracing::info!(
+            published,
+            pending = self.pending.len(),
+            "pending drained while ws connected"
+        );
     }
 }
 
@@ -244,9 +325,11 @@ pub async fn run(state: SharedState) {
             return;
         }
 
-        // WSが1本でも接続中ならpollしない
+        // WSが1本でも接続中ならpollしない(ただし持ち越し分は処理し切る —
+        // WSは切断中に発行された電文を再配信しない)
         if !all_ws_down(&state) {
             poller.set_active(false);
+            poller.drain_pending().await;
             continue;
         }
 
