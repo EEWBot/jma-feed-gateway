@@ -37,6 +37,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub jma: JmaConfig,
     pub dmdata: DmdataConfig,
+    pub poll: PollConfig,
     pub cache: CacheConfig,
 }
 
@@ -87,6 +88,18 @@ pub struct ReconnectConfig {
     pub initial_secs: u64,
     pub max_secs: u64,
     pub multiplier: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PollConfig {
+    /// 全WS切断中のフォールバックpollingを有効にするか。
+    pub enabled: bool,
+    /// 毎分この秒にpollする(壁時計基準、0〜59)。
+    pub offset_secs: u64,
+    /// 1 tickで実体取得する最大entry数(バースト保護)。
+    pub entry_fetch_limit: usize,
+    /// ReportDateTime逆順の訂正報を取りこぼさないための遡り猶予(秒)。
+    pub watermark_slack_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +156,14 @@ impl Config {
                 "dmdata.ws_endpoints must contain 1 or 2 endpoints".into(),
             ));
         }
+        if self.poll.offset_secs >= 60 {
+            return Err(ConfigError::Invalid("poll.offset_secs must be < 60".into()));
+        }
+        if self.poll.entry_fetch_limit == 0 {
+            return Err(ConfigError::Invalid(
+                "poll.entry_fetch_limit must be > 0".into(),
+            ));
+        }
         if self.cache.feed_entries == 0 {
             return Err(ConfigError::Invalid(
                 "cache.feed_entries must be > 0".into(),
@@ -186,6 +207,10 @@ mod tests {
             );
             assert_eq!(config.dmdata.classifications, vec!["telegram.earthquake"]);
             assert!(config.dmdata.api_key.is_none());
+            assert!(config.poll.enabled);
+            assert_eq!(config.poll.offset_secs, 20);
+            assert_eq!(config.poll.entry_fetch_limit, 20);
+            assert_eq!(config.poll.watermark_slack_secs, 600);
             Ok(())
         });
     }
@@ -231,6 +256,28 @@ mod tests {
             // Debug出力に秘密が漏れないこと
             let debug = format!("{:?}", config);
             assert!(!debug.contains("test-key-123"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_poll_values_rejected() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JMA_RELAY__POLL__OFFSET_SECS", "60");
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JMA_RELAY__POLL__ENTRY_FETCH_LIMIT", "0");
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
             Ok(())
         });
     }

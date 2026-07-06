@@ -23,6 +23,8 @@ pub struct Readiness {
     pub aggregator_running: AtomicBool,
     /// WS接続状態。要素数は設定した ws_endpoints の本数(1〜2)と一致する。
     pub ws_connected: Box<[AtomicBool]>,
+    /// フォールバックpolling稼働状態。poller が poll_once の成否で更新する。
+    pub poll_active: AtomicBool,
 }
 
 impl Readiness {
@@ -32,14 +34,17 @@ impl Readiness {
             initial_feed_loaded: AtomicBool::new(false),
             aggregator_running: AtomicBool::new(false),
             ws_connected: (0..ws_count).map(|_| AtomicBool::new(false)).collect(),
+            poll_active: AtomicBool::new(false),
         }
     }
 
-    /// ready = 初期一覧取得済み && aggregator稼働中 && WSがいずれか接続中。
+    /// ready = 初期一覧取得済み && aggregator稼働中 &&
+    /// (WSがいずれか接続中 || フォールバックpolling稼働中)。
     pub fn is_ready(&self) -> bool {
         self.initial_feed_loaded.load(Ordering::Relaxed)
             && self.aggregator_running.load(Ordering::Relaxed)
-            && self.ws_connected.iter().any(|b| b.load(Ordering::Relaxed))
+            && (self.ws_connected.iter().any(|b| b.load(Ordering::Relaxed))
+                || self.poll_active.load(Ordering::Relaxed))
     }
 
     pub fn snapshot(&self) -> ReadinessSnapshot {
@@ -51,6 +56,7 @@ impl Readiness {
                 .iter()
                 .map(|b| b.load(Ordering::Relaxed))
                 .collect(),
+            poll: self.poll_active.load(Ordering::Relaxed),
         }
     }
 }
@@ -60,6 +66,7 @@ pub struct ReadinessSnapshot {
     pub feed: bool,
     pub aggregator: bool,
     pub ws: Vec<bool>,
+    pub poll: bool,
 }
 
 pub struct AppState {

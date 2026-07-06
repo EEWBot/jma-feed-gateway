@@ -29,6 +29,9 @@ pub enum EventSource {
     Dmdata { telegram_id: String, conn: usize },
     /// JMAフィード/実体取得(キャッシュミス補充)由来。一覧は再生成しない。
     JmaFeed,
+    /// 全WS切断中のフォールバックpolling由来。実JMA IDを持ち、
+    /// dmdata由来と同じpinned+publish経路に載る。
+    JmaPoll,
 }
 
 /// 重複排除キー。

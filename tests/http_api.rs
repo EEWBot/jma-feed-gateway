@@ -282,6 +282,7 @@ async fn readyz_503_then_200() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["feed"], false);
     assert_eq!(json["ws"], serde_json::json!([false]));
+    assert_eq!(json["poll"], false);
 
     state
         .readiness
@@ -306,6 +307,17 @@ async fn readyz_503_then_200() {
     assert_eq!(json["feed"], true);
     assert_eq!(json["aggregator"], true);
     assert_eq!(json["ws"], serde_json::json!([true]));
+
+    // WS全断でもフォールバックpolling稼働中はready
+    state.readiness.ws_connected[0].store(false, Ordering::Relaxed);
+    let response = get(&router, "/readyz", None).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    state.readiness.poll_active.store(true, Ordering::Relaxed);
+    let response = get(&router, "/readyz", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["poll"], true);
 }
 
 #[tokio::test]

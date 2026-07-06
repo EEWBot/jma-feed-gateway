@@ -8,6 +8,7 @@
 //! - [`http`][]: axumルーター・ハンドラ(読み取り専用)
 //! - [`fetcher`][]: 初期一覧取得とキャッシュミス時のsingleflight実体取得
 //! - [`dmdata`][]: DMDATA.JP REST API / WebSocket連携
+//! - [`poller`][]: 全WS切断中のJMAフィードpollingフォールバック
 //! - [`aggregator`][]: 唯一の書き込み点となる単一タスク
 
 pub mod aggregator;
@@ -17,5 +18,6 @@ pub mod error;
 pub mod fetcher;
 pub mod http;
 pub mod jma;
+pub mod poller;
 pub mod state;
 pub mod types;

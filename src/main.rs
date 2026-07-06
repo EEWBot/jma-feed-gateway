@@ -1,4 +1,4 @@
-//! 起動シーケンス: 設定 → HTTPクライアント → 初期一覧 → Aggregator → WS×2 → HTTPサーバ。
+//! 起動シーケンス: 設定 → HTTPクライアント → 初期一覧 → Aggregator → WS×2 → Poller → HTTPサーバ。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -11,7 +11,7 @@ use jma_relay::config::Config;
 use jma_relay::error::AppError;
 use jma_relay::state::AppState;
 use jma_relay::types::Event;
-use jma_relay::{aggregator, dmdata, fetcher, http};
+use jma_relay::{aggregator, dmdata, fetcher, http, poller};
 
 #[tokio::main]
 async fn main() {
@@ -58,6 +58,9 @@ async fn run() -> Result<(), AppError> {
             state.clone(),
         ));
     }
+
+    // 全WS切断中のフォールバックpolling(enabled=falseならタスク内で終了)
+    tokio::spawn(poller::run(state.clone()));
 
     let app = http::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.http.bind_addr).await?;

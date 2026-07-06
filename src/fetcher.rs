@@ -117,7 +117,8 @@ fn merge_feeds(preferred: Vec<ItemMeta>, secondary: Vec<ItemMeta>) -> Vec<ItemMe
 }
 
 /// telegram_typesが空なら全通過。非空なら種別抽出不能なentryも除外する。
-fn filter_by_types(items: Vec<ItemMeta>, types: &[String]) -> Vec<ItemMeta> {
+/// poller もフィルターを共有する(pub(crate))。
+pub(crate) fn filter_by_types(items: Vec<ItemMeta>, types: &[String]) -> Vec<ItemMeta> {
     if types.is_empty() {
         return items;
     }
@@ -204,7 +205,11 @@ pub async fn fetch_entity(state: SharedState, id: String, result_tx: InflightTx)
     }
 }
 
-async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<bytes::Bytes, UpstreamError> {
+/// 実体XMLを1件GETする。poller の候補取得と共有する(pub(crate))。
+pub(crate) async fn fetch_bytes(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<bytes::Bytes, UpstreamError> {
     let response = client.get(url).send().await?;
     let status = response.status();
     if !status.is_success() {

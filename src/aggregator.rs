@@ -14,14 +14,21 @@ use crate::state::SharedState;
 use crate::types::{DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta};
 
 /// 重複排除。TTL付きのseenキャッシュ。
+/// `seen` はソース固有ID(dmdata電文ID等)、`body_seen` は本文blake3ハッシュによる
+/// クロスソースdedupe(同一電文がdmdataとJMA pollingで別IDになるため)。
 pub struct Deduper {
     seen: moka::sync::Cache<DedupKey, ()>,
+    body_seen: moka::sync::Cache<[u8; 32], ()>,
 }
 
 impl Deduper {
     pub fn new(ttl: Duration) -> Self {
         Self {
             seen: moka::sync::Cache::builder()
+                .max_capacity(65_536)
+                .time_to_live(ttl)
+                .build(),
+            body_seen: moka::sync::Cache::builder()
                 .max_capacity(65_536)
                 .time_to_live(ttl)
                 .build(),
@@ -34,6 +41,17 @@ impl Deduper {
             return false;
         }
         self.seen.insert(key.clone(), ());
+        true
+    }
+
+    /// 本文ハッシュが未見なら登録して true、既見なら false。
+    /// publish経路(dmdata / poll)のみが呼ぶ。JmaFeed(キャッシュミス補充)由来では
+    /// 呼ばないこと — 補充がpublish-dedupeを汚染し、後続の正規配信をdropしてしまう。
+    pub fn check_and_insert_body(&self, hash: &[u8; 32]) -> bool {
+        if self.body_seen.contains_key(hash) {
+            return false;
+        }
+        self.body_seen.insert(*hash, ());
         true
     }
 }
@@ -69,7 +87,16 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
             continue;
         }
 
-        // dmdata由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
+        // クロスソースdedupe: 同一電文はdmdataとJMA pollingでentry IDが異なるため
+        // 本文blake3ハッシュで突合する。JmaFeed early-return の後に置くことで
+        // キャッシュミス補充がpublish-dedupeを汚染しない。
+        let body_hash = *blake3::hash(&event.xml_body).as_bytes();
+        if !deduper.check_and_insert_body(&body_hash) {
+            tracing::debug!(id = %event.meta.id, "duplicate body dropped (cross-source)");
+            continue;
+        }
+
+        // dmdata/poll由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
         // 同一id再送は insert がArcを置換する。
         state.pinned.insert(event.meta.id.clone(), entry);
 
@@ -140,6 +167,18 @@ mod tests {
         assert!(deduper.check_and_insert(&key));
         assert!(!deduper.check_and_insert(&key));
         assert!(deduper.check_and_insert(&DedupKey::TelegramId("t2".into())));
+    }
+
+    #[test]
+    fn deduper_body_hash_rejects_second_insert() {
+        let deduper = Deduper::new(Duration::from_secs(60));
+        let a = *blake3::hash(b"body-a").as_bytes();
+        let b = *blake3::hash(b"body-b").as_bytes();
+        assert!(deduper.check_and_insert_body(&a));
+        assert!(!deduper.check_and_insert_body(&a));
+        // 別ハッシュは独立
+        assert!(deduper.check_and_insert_body(&b));
+        assert!(!deduper.check_and_insert_body(&b));
     }
 
     #[test]
