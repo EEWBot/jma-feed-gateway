@@ -13,10 +13,10 @@ use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use jma_relay::config::{Config, DEFAULT_CONFIG_TOML};
-use jma_relay::poller::{PollOutcome, Poller};
-use jma_relay::state::{AppState, SharedState};
-use jma_relay::types::{Event, EventSource, FeedSnapshot};
+use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
+use jma_feed_gateway::poller::{PollOutcome, Poller};
+use jma_feed_gateway::state::{AppState, SharedState};
+use jma_feed_gateway::types::{Event, EventSource, FeedSnapshot};
 
 const FEED_PATH: &str = "/developer/xml/feed/eqvol.xml";
 const OLD_ID: &str = "20260705035000_0_VXSE53_010000";

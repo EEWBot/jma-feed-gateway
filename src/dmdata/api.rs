@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DmdataError;
 
-const USER_AGENT: &str = concat!("jma-relay/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("jma-feed-gateway/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,7 +229,7 @@ mod tests {
             .and(body_partial_json(serde_json::json!({
                 "classifications": ["telegram.earthquake"],
                 "test": "no",
-                "appName": "jma-relay-1",
+                "appName": "jma-feed-gateway-1",
                 "formatMode": "raw"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -238,7 +238,7 @@ mod tests {
                 "ticket": "TICKET123",
                 "websocket": {"id": 555, "url": "wss://ws-tokyo.api.dmdata.jp/v2/websocket", "protocol": ["dmdata.v2"], "expiration": 300},
                 "classifications": ["telegram.earthquake"],
-                "appName": "jma-relay-1"
+                "appName": "jma-feed-gateway-1"
             })))
             .expect(1)
             .mount(&server)
@@ -247,7 +247,7 @@ mod tests {
         let request = SocketStartRequest::new(
             vec!["telegram.earthquake".into()],
             None,
-            "jma-relay-1".into(),
+            "jma-feed-gateway-1".into(),
         );
         let response = api(&server)
             .socket_start(&request)
@@ -289,7 +289,7 @@ mod tests {
                 "responseId": "r3",
                 "status": "ok",
                 "items": [
-                    {"id": 101, "appName": "jma-relay-1", "status": "open", "server": "ws-tokyo"},
+                    {"id": 101, "appName": "jma-feed-gateway-1", "status": "open", "server": "ws-tokyo"},
                     {"id": 102, "appName": "other-app", "status": "open"}
                 ]
             })))
@@ -300,7 +300,7 @@ mod tests {
         let list = api(&server).socket_list_open().await.expect("must succeed");
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].id, 101);
-        assert_eq!(list.items[0].app_name.as_deref(), Some("jma-relay-1"));
+        assert_eq!(list.items[0].app_name.as_deref(), Some("jma-feed-gateway-1"));
     }
 
     #[tokio::test]

@@ -7,11 +7,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use jma_relay::config::Config;
-use jma_relay::error::AppError;
-use jma_relay::state::AppState;
-use jma_relay::types::Event;
-use jma_relay::{aggregator, dmdata, fetcher, http, poller};
+use jma_feed_gateway::config::Config;
+use jma_feed_gateway::error::AppError;
+use jma_feed_gateway::state::AppState;
+use jma_feed_gateway::types::Event;
+use jma_feed_gateway::{aggregator, dmdata, fetcher, http, poller};
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +32,7 @@ async fn run() -> Result<(), AppError> {
     tracing::info!(bind_addr = %config.http.bind_addr, "configuration loaded");
 
     let client = reqwest::Client::builder()
-        .user_agent(concat!("jma-relay/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("jma-feed-gateway/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(config.jma.fetch_timeout_secs))
         .build()?;
 

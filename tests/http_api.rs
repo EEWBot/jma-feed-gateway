@@ -14,10 +14,10 @@ use figment::providers::{Format, Toml};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use jma_relay::config::{Config, DEFAULT_CONFIG_TOML};
-use jma_relay::http::build_router;
-use jma_relay::state::{AppState, SharedState};
-use jma_relay::types::{EntityEntry, Event, FeedSnapshot, ItemMeta};
+use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
+use jma_feed_gateway::http::build_router;
+use jma_feed_gateway::state::{AppState, SharedState};
+use jma_feed_gateway::types::{EntityEntry, Event, FeedSnapshot, ItemMeta};
 use tokio::sync::mpsc;
 
 const FEED_PATH: &str = "/developer/xml/feed/eqvol.xml";
@@ -342,7 +342,7 @@ async fn singleflight_hits_upstream_once() {
         c.jma.data_base_url = mock_server.uri();
     });
     // fetch_entity はEvent経由でaggregatorに渡すため、aggregatorを起動する
-    tokio::spawn(jma_relay::aggregator::run(Vec::new(), rx, state.clone()));
+    tokio::spawn(jma_feed_gateway::aggregator::run(Vec::new(), rx, state.clone()));
     for _ in 0..100 {
         if state.readiness.aggregator_running.load(Ordering::Relaxed) {
             break;

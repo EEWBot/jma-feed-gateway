@@ -1,7 +1,7 @@
-# jma-relay デフォルト設定。
-# 全ての値は環境変数 `JMA_RELAY__<SECTION>__<KEY>`(区切りは `__`)で上書き可能。
-# 例: JMA_RELAY__HTTP__BIND_ADDR=0.0.0.0:9000
-# 秘密情報(dmdata.api_key)は環境変数 JMA_RELAY__DMDATA__API_KEY で設定すること。
+# jma-feed-gateway デフォルト設定。
+# 全ての値は環境変数 `JMA_FEED_GATEWAY__<SECTION>__<KEY>`(区切りは `__`)で上書き可能。
+# 例: JMA_FEED_GATEWAY__HTTP__BIND_ADDR=0.0.0.0:9000
+# 秘密情報(dmdata.api_key)は環境変数 JMA_FEED_GATEWAY__DMDATA__API_KEY で設定すること。
 
 [http]
 bind_addr = "127.0.0.1:8080"
@@ -41,7 +41,7 @@ types = [
     "VTSE41", "VTSE51", "VTSE52",
     "VZSE40",
 ]
-app_name = "jma-relay"
+app_name = "jma-feed-gateway"
 cleanup_stale_sockets = true
 
 [dmdata.reconnect]

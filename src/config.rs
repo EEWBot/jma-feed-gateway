@@ -13,8 +13,8 @@ use crate::error::ConfigError;
 /// 埋め込みデフォルト設定(`config/default.toml` と同一内容)。
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
 
-/// 環境変数プレフィクス。`JMA_RELAY__HTTP__BIND_ADDR` のように `__` 区切りでネストする。
-pub const ENV_PREFIX: &str = "JMA_RELAY__";
+/// 環境変数プレフィクス。`JMA_FEED_GATEWAY__HTTP__BIND_ADDR` のように `__` 区切りでネストする。
+pub const ENV_PREFIX: &str = "JMA_FEED_GATEWAY__";
 
 /// Debug 出力で中身を秘匿する秘密文字列(APIキー等)。
 #[derive(Clone, Deserialize)]
@@ -67,7 +67,7 @@ pub struct JmaConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DmdataConfig {
-    /// DMDATA APIキー。環境変数 `JMA_RELAY__DMDATA__API_KEY` で設定する。
+    /// DMDATA APIキー。環境変数 `JMA_FEED_GATEWAY__DMDATA__API_KEY` で設定する。
     pub api_key: Option<Secret>,
     pub api_base: String,
     /// WebSocketエンドポイント(最大2系統)。
@@ -245,9 +245,9 @@ mod tests {
                 bind_addr = "0.0.0.0:9999"
                 "#,
             )?;
-            jail.set_env("JMA_RELAY__HTTP__BIND_ADDR", "127.0.0.1:7777");
-            jail.set_env("JMA_RELAY__DMDATA__API_KEY", "test-key-123");
-            jail.set_env("JMA_RELAY__CACHE__FEED_ENTRIES", "42");
+            jail.set_env("JMA_FEED_GATEWAY__HTTP__BIND_ADDR", "127.0.0.1:7777");
+            jail.set_env("JMA_FEED_GATEWAY__DMDATA__API_KEY", "test-key-123");
+            jail.set_env("JMA_FEED_GATEWAY__CACHE__FEED_ENTRIES", "42");
             let config = Config::from_figment(Config::figment()).expect("config must load");
             assert_eq!(config.http.bind_addr, "127.0.0.1:7777");
             assert_eq!(config.cache.feed_entries, 42);
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn invalid_poll_values_rejected() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JMA_RELAY__POLL__OFFSET_SECS", "60");
+            jail.set_env("JMA_FEED_GATEWAY__POLL__OFFSET_SECS", "60");
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),
@@ -272,7 +272,7 @@ mod tests {
             Ok(())
         });
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JMA_RELAY__POLL__ENTRY_FETCH_LIMIT", "0");
+            jail.set_env("JMA_FEED_GATEWAY__POLL__ENTRY_FETCH_LIMIT", "0");
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn invalid_ws_endpoints_rejected() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JMA_RELAY__DMDATA__WS_ENDPOINTS", r#"["a", "b", "c"]"#);
+            jail.set_env("JMA_FEED_GATEWAY__DMDATA__WS_ENDPOINTS", r#"["a", "b", "c"]"#);
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),

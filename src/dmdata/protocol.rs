@@ -198,7 +198,7 @@ mod tests {
         };
         assert_eq!(start.socket_id, Some(12345));
         assert_eq!(start.classifications, vec!["telegram.earthquake"]);
-        assert_eq!(start.app_name.as_deref(), Some("jma-relay-1"));
+        assert_eq!(start.app_name.as_deref(), Some("jma-feed-gateway-1"));
     }
 
     #[test]

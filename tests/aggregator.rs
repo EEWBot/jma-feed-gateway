@@ -9,10 +9,10 @@ use figment::Figment;
 use figment::providers::{Format, Toml};
 use tokio::sync::mpsc;
 
-use jma_relay::aggregator;
-use jma_relay::config::{Config, DEFAULT_CONFIG_TOML};
-use jma_relay::state::{AppState, SharedState};
-use jma_relay::types::{DedupKey, Event, EventSource, ItemMeta};
+use jma_feed_gateway::aggregator;
+use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
+use jma_feed_gateway::state::{AppState, SharedState};
+use jma_feed_gateway::types::{DedupKey, Event, EventSource, ItemMeta};
 
 fn meta(id: &str, title: &str, updated: &str) -> ItemMeta {
     ItemMeta {

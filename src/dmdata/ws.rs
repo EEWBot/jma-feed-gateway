@@ -201,7 +201,7 @@ pub async fn run_connection(
     let Some(api_key) = cfg.api_key.as_ref() else {
         tracing::warn!(
             conn = index,
-            "dmdata api_key not set (JMA_RELAY__DMDATA__API_KEY); ws connection disabled"
+            "dmdata api_key not set (JMA_FEED_GATEWAY__DMDATA__API_KEY); ws connection disabled"
         );
         return;
     };
