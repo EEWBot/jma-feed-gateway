@@ -1,22 +1,23 @@
 //! 全WS切断中のフォールバックpollingと、WS復帰時のcatch-up poll。
 //!
 //! 毎分 `poll.offset_secs` 秒(壁時計基準)に dmdata telegram.list を1ページ取得し、
-//! 新規電文を telegram.data v1 から取得してfeedへpublishする。
+//! 新規電文をmeta-onlyのEventとしてfeedへpublishする(実体はここでは取得しない)。
+//! 実体は初回HTTPアクセス時にCacheFill経路(singleflight + `[rate_limit]`)で
+//! 遅延取得される。
 //! 全WS復帰時は `ws_recovered` 通知で即座にcatch-up pollを1回走らせ、
 //! 切断窓 [切断, 復帰] の取り逃しをtick時刻を待たずに埋める。
 //!
 //! 不変条件:
-//! - 候補選別は共有Deduper(`state.deduper`)+ `state.pinned` の事前フィルタのみ。
-//!   pollerは独自のseen状態を持たず、publish後のseen登録もaggregatorに任せる。
-//!   この事前フィルタは「mpscチャネル在中でaggregator未処理」のWS eventを
-//!   見逃しうるが、帰結は無駄な telegram.get 1回と後段dropのみで、
+//! - 候補選別は共有Deduper(`state.deduper`)+ `state.feed_ids`(feed在中ID)の
+//!   事前フィルタのみ。pollerは独自のseen状態を持たず、publish後のseen登録も
+//!   aggregatorに任せる。この事前フィルタは「mpscチャネル在中でaggregator未処理」
+//!   のWS eventを見逃しうるが、帰結は無駄なpublish 1回と後段dropのみで、
 //!   フィードの正しさ・重複には影響しない(正しさはaggregatorの
 //!   `check_and_insert` が唯一の判定点として保証する)。
-//! - backlogフラグ契約: fetch失敗・上限超過・list失敗があったtickは
-//!   `backlog = true`。backlogがある限りWS接続中でも毎分tickでpollを続ける
+//! - backlogフラグ契約: list取得に失敗したtickだけ `backlog = true`。
+//!   backlogがある限りWS接続中でも毎分tickでpollを続ける
 //!   (WSは切断中に発行された電文を再配信しないため、pollで捌き切る)。
-//!   クリーンなtickで自動クリアされ、リストから消えた項目は次tickの候補に
-//!   現れないため滞留の自然な上限も成立する。
+//!   成功したtickで自動クリアされる。
 //! - WS接続中のpoll(backlog消化・catch-up)では `poll_active` を更新しない
 //!   (readinessの意味「fallbackが生きた供給源」を保つ)。
 //! - poll由来のEventは `DedupKey::TelegramId`(WSと同一ID)を使うため、
@@ -36,7 +37,7 @@ use crate::types::{DedupKey, Event, EventSource, ItemMeta};
 #[doc(hidden)]
 pub struct Poller {
     state: SharedState,
-    /// 前tickに未処理の候補(fetch失敗・上限超過・list失敗)が残った可能性。
+    /// 前tickのlist取得が失敗し、取り逃しが残った可能性。
     /// WS接続中でもtickでpollを続ける根拠になる。
     backlog: bool,
     /// 遷移ログ用: 直前tickでpolling稼働していたか。
@@ -101,8 +102,8 @@ impl Poller {
             .telegram_list(&classification, None, fetcher::LIST_PAGE_LIMIT)
             .await?;
 
-        // 候補選別: 共有Deduper既知(publish済み)または pinned 在中(feed在中)の
-        // IDは無駄な telegram.get を避けるためskipする
+        // 候補選別: 共有Deduper既知(publish済み)または feed_ids 在中(feed在中)の
+        // IDは無駄なpublishを避けるためskipする
         let mut candidates: Vec<ItemMeta> = page
             .items
             .iter()
@@ -112,55 +113,35 @@ impl Poller {
                     .state
                     .deduper
                     .contains(&DedupKey::TelegramId(meta.id.clone()))
-                    && !self.state.pinned.contains_key(&meta.id)
+                    && !self.state.feed_ids.contains(&meta.id)
             })
             .collect();
         // updated は select_item で+09:00へ正規化済みのRFC3339なので辞書順比較=時系列比較
         candidates.sort_by(|a, b| a.updated.cmp(&b.updated));
 
-        let mut had_backlog = false;
-
-        // バースト保護: 最新 entry_fetch_limit 件のみ処理し、古い側は単に落とす
-        // (seen未登録なので次tickのリストから自然に再選別される)
-        let deferred = candidates
-            .len()
-            .saturating_sub(config.poll.entry_fetch_limit);
-        if deferred > 0 {
-            tracing::warn!(deferred, "poll candidates exceed entry_fetch_limit");
-            candidates.drain(..deferred);
-            had_backlog = true;
-        }
-
         let mut published = 0usize;
         for meta in candidates {
-            let body = match self.state.dmdata_api.telegram_get(&meta.id).await {
-                Ok(body) => body,
-                Err(e) => {
-                    // seen未登録のまま落とす → 次tickで自然に再選別される
-                    tracing::warn!(error = %e, id = %meta.id, "poll entry fetch failed");
-                    had_backlog = true;
-                    continue;
-                }
-            };
+            // meta-onlyでpublishする。実体は初回アクセス時にCacheFill経路
+            // (singleflight + rate limiter)で遅延取得される
             let event = Event {
                 source: EventSource::DmdataPoll,
                 // WSと同じdmdata電文ID — WS復帰時・poll重複時のdedupが成立する
                 dedup_key: DedupKey::TelegramId(meta.id.clone()),
-                xml_body: body,
+                xml_body: None,
                 meta,
             };
             if self.state.event_tx.send(event).await.is_err() {
                 // runが次tickの is_closed チェックで終了する
                 tracing::warn!("aggregator channel closed; polled entry dropped");
-                self.backlog = had_backlog;
                 return Ok(published);
             }
             // seen登録はしない(書き込みはaggregatorのみ)
             published += 1;
         }
 
-        self.backlog = had_backlog;
-        tracing::info!(published, backlog = self.backlog, "poll tick completed");
+        // listを取り切れた=取り逃しなし。backlogはlist取得失敗のみが立てる
+        self.backlog = false;
+        tracing::info!(published, "poll tick completed");
         Ok(published)
     }
 }

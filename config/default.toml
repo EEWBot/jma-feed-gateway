@@ -48,8 +48,6 @@ multiplier = 2.0
 enabled = true
 # 毎分この秒にpollする(壁時計基準、0〜59)
 offset_secs = 20
-# 1 tickで実体取得する最大entry数(バースト保護)
-entry_fetch_limit = 20
 
 [rate_limit]
 # 外部リクエスト起因の dmdata telegram.data 呼び出し上限(スライディングウィンドウ)

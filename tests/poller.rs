@@ -1,5 +1,7 @@
 //! Pollerの統合テスト: wiremockでdmdata(telegram.list / telegram.data)を模擬し、
-//! poll_once の候補フィルタ / backlog契約 / readiness遷移 / catch-upを検証する。
+//! poll_once の候補フィルタ / meta-only publish / backlog契約 / readiness遷移 /
+//! catch-upを検証する。pollerは実体(telegram.data)を一切fetchしない —
+//! 実体は初回HTTPアクセス時にCacheFill経路で遅延取得される。
 //! pollerはseen登録しないため、tick間で受信IDを `state.deduper` へ挿入して
 //! aggregatorを模擬する。壁時計ループ(run)はテスト対象外
 //! (tokio::time::pause は now_utc を動かせない)。
@@ -20,7 +22,7 @@ use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::poller::Poller;
 use jma_feed_gateway::state::{AppState, SharedState};
-use jma_feed_gateway::types::{DedupKey, EntityEntry, Event, EventSource, ItemMeta};
+use jma_feed_gateway::types::{DedupKey, Event, EventSource, ItemMeta};
 
 const LIST_PATH: &str = "/telegram";
 const OLD_ID: &str = "TELEGRAM_OLD_VXSE53_0000000000000000000000000000000000000000";
@@ -55,19 +57,10 @@ fn entity_xml(id: &str) -> String {
 
 /// モックサーバへ向けた state / event受信口 / Poller を作る。
 async fn setup(server: &MockServer) -> (SharedState, mpsc::Receiver<Event>, Poller) {
-    setup_with(server, |_| {}).await
-}
-
-/// setup の設定調整版(entry_fetch_limit 等を上書きするテスト用)。
-async fn setup_with(
-    server: &MockServer,
-    mutate: impl FnOnce(&mut Config),
-) -> (SharedState, mpsc::Receiver<Event>, Poller) {
     let mut config: Config = Config::from_figment(Figment::from(Toml::string(DEFAULT_CONFIG_TOML)))
         .expect("default config must load");
     config.dmdata.api_base = server.uri();
     config.dmdata.data_api_base = format!("{}/v1", server.uri());
-    mutate(&mut config);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -95,11 +88,13 @@ async fn mount_list(server: &MockServer, entries: &[(&str, &str)]) {
         .await;
 }
 
-/// telegram.data(実体)エンドポイントのモックを登録する。
-async fn mount_entity(server: &MockServer, id: &str) {
+/// telegram.data(実体)エンドポイントのモックを登録する(遅延取得の検証用に
+/// ちょうど1回のfetchを期待する)。
+async fn mount_entity_once(server: &MockServer, id: &str) {
     Mock::given(method("GET"))
         .and(path(format!("/v1/{id}")))
         .respond_with(ResponseTemplate::new(200).set_body_string(entity_xml(id)))
+        .expect(1)
         .mount(server)
         .await;
 }
@@ -135,10 +130,10 @@ async fn first_poll_publishes_then_deduper_skips_next_tick() {
         ])))
         .mount(&server)
         .await;
-    mount_entity(&server, NEW_ID).await;
-    mount_entity(&server, OLD_ID).await;
+    mount_entity_never(&server, NEW_ID).await;
+    mount_entity_never(&server, OLD_ID).await;
 
-    // 初回poll: 2件ともupdated昇順でpublish
+    // 初回poll: 2件ともupdated昇順でmeta-only publish(実体fetchなし)
     let published = poller
         .poll_once(true)
         .await
@@ -150,7 +145,7 @@ async fn first_poll_publishes_then_deduper_skips_next_tick() {
     assert_eq!(first.meta.id, OLD_ID);
     assert_eq!(first.source, EventSource::DmdataPoll);
     assert_eq!(first.dedup_key, DedupKey::TelegramId(OLD_ID.into()));
-    assert_eq!(&first.xml_body[..], entity_xml(OLD_ID).as_bytes());
+    assert!(first.xml_body.is_none(), "polled event must be meta-only");
     let second = rx
         .try_recv()
         .expect("newest entry must be published second");
@@ -173,7 +168,7 @@ async fn first_poll_publishes_then_deduper_skips_next_tick() {
 }
 
 #[tokio::test]
-async fn deduper_known_id_is_not_fetched() {
+async fn deduper_known_id_is_not_published() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
@@ -188,8 +183,7 @@ async fn deduper_known_id_is_not_fetched() {
         ],
     )
     .await;
-    mount_entity(&server, NEW_ID).await;
-    // deduper既知のentryの実体は一切リクエストされないこと
+    mount_entity_never(&server, NEW_ID).await;
     mount_entity_never(&server, OLD_ID).await;
 
     let published = poller.poll_once(true).await.expect("poll must succeed");
@@ -201,23 +195,12 @@ async fn deduper_known_id_is_not_fetched() {
 }
 
 #[tokio::test]
-async fn pinned_id_is_not_fetched() {
+async fn feed_resident_id_is_not_published() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
-    // OLD_IDはfeed在中(pinned)— seen TTL失効後もfetchしない
-    let meta = ItemMeta {
-        id: OLD_ID.into(),
-        updated: "2026-07-05T03:50:00+09:00".into(),
-        ..ItemMeta::default()
-    };
-    state.pinned.insert(
-        OLD_ID.into(),
-        Arc::new(EntityEntry::new(
-            Bytes::from_static(b"<Report>pinned</Report>"),
-            meta,
-        )),
-    );
+    // OLD_IDはfeed在中(feed_ids)— seen TTL失効後も再publishしない
+    state.feed_ids.insert(OLD_ID.into());
 
     mount_list(
         &server,
@@ -227,7 +210,7 @@ async fn pinned_id_is_not_fetched() {
         ],
     )
     .await;
-    mount_entity(&server, NEW_ID).await;
+    mount_entity_never(&server, NEW_ID).await;
     mount_entity_never(&server, OLD_ID).await;
 
     let published = poller.poll_once(true).await.expect("poll must succeed");
@@ -237,119 +220,27 @@ async fn pinned_id_is_not_fetched() {
 }
 
 #[tokio::test]
-async fn fetch_failure_sets_backlog_and_entry_is_republished_next_tick() {
-    let server = MockServer::start().await;
-    let (state, mut rx, mut poller) = setup(&server).await;
-
-    mount_list(
-        &server,
-        &[
-            (NEW_ID, "2026-07-05T04:11:00+09:00"),
-            (OLD_ID, "2026-07-05T03:50:00+09:00"),
-        ],
-    )
-    .await;
-    // 古い側の実体: 初回だけ500、以降200
-    Mock::given(method("GET"))
-        .and(path(format!("/v1/{OLD_ID}")))
-        .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    mount_entity(&server, OLD_ID).await;
-    mount_entity(&server, NEW_ID).await;
-
-    // 初回: OLDのfetch失敗 → backlog=true、NEWはpublish
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("first poll must succeed");
-    assert_eq!(published, 1);
-    assert!(poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
-    assert!(rx.try_recv().is_err());
-
-    mark_delivered(&state, NEW_ID);
-
-    // 2回目: OLDがリストから自然に再選別され publish、クリーンtickでbacklogクリア
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("retry poll must succeed");
-    assert_eq!(published, 1);
-    assert!(!poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, OLD_ID);
-
-    mark_delivered(&state, OLD_ID);
-
-    // 3回目: 全件deduper既知 → 何もpublishしない
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("third poll must succeed");
-    assert_eq!(published, 0);
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn over_limit_candidates_are_dropped_and_published_next_tick() {
-    let server = MockServer::start().await;
-    let (state, mut rx, mut poller) = setup_with(&server, |c| c.poll.entry_fetch_limit = 1).await;
-
-    mount_list(
-        &server,
-        &[
-            (NEW_ID, "2026-07-05T04:11:00+09:00"),
-            (OLD_ID, "2026-07-05T03:50:00+09:00"),
-        ],
-    )
-    .await;
-    mount_entity(&server, NEW_ID).await;
-    mount_entity(&server, OLD_ID).await;
-
-    // 初回: 上限1件 → 最新のみpublish、古い側は単に落として backlog=true
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("first poll must succeed");
-    assert_eq!(published, 1);
-    assert!(poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
-    assert!(rx.try_recv().is_err());
-
-    mark_delivered(&state, NEW_ID);
-
-    // 2回目: 落とした分がリストから再選別されpublish
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("second poll must succeed");
-    assert_eq!(published, 1);
-    assert!(!poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, OLD_ID);
-}
-
-#[tokio::test]
 async fn backlog_drain_while_ws_connected_does_not_set_poll_active() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
-    mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
-    // 実体: 初回だけ500、以降200
+    // list取得: 初回だけ500、以降200
     Mock::given(method("GET"))
-        .and(path(format!("/v1/{NEW_ID}")))
+        .and(path(LIST_PATH))
         .respond_with(ResponseTemplate::new(500))
         .up_to_n_times(1)
         .with_priority(1)
         .mount(&server)
         .await;
-    mount_entity(&server, NEW_ID).await;
+    mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
+    mount_entity_never(&server, NEW_ID).await;
 
-    // WS接続中(fallback=false)のtickでfetch失敗 → backlog=true、poll_activeは不変
+    // WS接続中(fallback=false)のtickでlist失敗 → backlog=true、poll_activeは不変
     state.readiness.ws_connected[0].store(true, Ordering::Relaxed);
-    let published = poller.poll_once(false).await.expect("poll must succeed");
-    assert_eq!(published, 0);
+    poller
+        .poll_once(false)
+        .await
+        .expect_err("first poll must fail");
     assert!(poller.has_backlog());
     assert!(!state.readiness.poll_active.load(Ordering::Relaxed));
 
@@ -360,58 +251,13 @@ async fn backlog_drain_while_ws_connected_does_not_set_poll_active() {
         .expect("drain poll must succeed");
     assert_eq!(published, 1);
     assert!(!poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    let event = rx.try_recv().unwrap();
+    assert_eq!(event.meta.id, NEW_ID);
+    assert!(event.xml_body.is_none(), "polled event must be meta-only");
     assert!(
         !state.readiness.poll_active.load(Ordering::Relaxed),
         "backlog drain while ws connected must not set poll_active"
     );
-}
-
-#[tokio::test]
-async fn backlog_clears_when_item_vanishes_from_list() {
-    let server = MockServer::start().await;
-    let (state, mut rx, mut poller) = setup(&server).await;
-
-    // 初回リスト: OLD(恒久500)+ NEW
-    Mock::given(method("GET"))
-        .and(path(LIST_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(list_body(&[
-            (NEW_ID, "2026-07-05T04:11:00+09:00"),
-            (OLD_ID, "2026-07-05T03:50:00+09:00"),
-        ])))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    // 2回目以降のリスト: OLDは一覧から消えた
-    mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
-    // OLDの実体は恒久的に500
-    Mock::given(method("GET"))
-        .and(path(format!("/v1/{OLD_ID}")))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    mount_entity(&server, NEW_ID).await;
-
-    // 初回: NEW publish、OLDは失敗 → backlog=true
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("first poll must succeed");
-    assert_eq!(published, 1);
-    assert!(poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
-
-    mark_delivered(&state, NEW_ID);
-
-    // 2回目: OLDがリストから消えた → 候補ゼロのクリーンtickでbacklogクリア
-    let published = poller
-        .poll_once(true)
-        .await
-        .expect("second poll must succeed");
-    assert_eq!(published, 0);
-    assert!(!poller.has_backlog());
-    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -480,17 +326,18 @@ async fn catch_up_after_recovery_publishes_only_missed_entry() {
         ],
     )
     .await;
-    mount_entity(&server, NEW_ID).await;
-    // 配信済み分はfetchされない
+    mount_entity_never(&server, NEW_ID).await;
     mount_entity_never(&server, OLD_ID).await;
 
-    // catch-up poll(WS接続中なので fallback=false)
+    // catch-up poll(WS接続中なので fallback=false)— meta-onlyでpublish
     let published = poller
         .poll_once(false)
         .await
         .expect("catch-up poll must succeed");
     assert_eq!(published, 1);
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    let event = rx.try_recv().unwrap();
+    assert_eq!(event.meta.id, NEW_ID);
+    assert!(event.xml_body.is_none(), "polled event must be meta-only");
     assert!(rx.try_recv().is_err());
     assert!(
         !state.readiness.poll_active.load(Ordering::Relaxed),
@@ -512,7 +359,7 @@ async fn catch_up_list_failure_sets_backlog_for_retry() {
         .mount(&server)
         .await;
     mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
-    mount_entity(&server, NEW_ID).await;
+    mount_entity_never(&server, NEW_ID).await;
 
     state.readiness.ws_connected[0].store(true, Ordering::Relaxed);
 
@@ -531,7 +378,9 @@ async fn catch_up_list_failure_sets_backlog_for_retry() {
         .expect("retry poll must succeed");
     assert_eq!(published, 1);
     assert!(!poller.has_backlog());
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    let event = rx.try_recv().unwrap();
+    assert_eq!(event.meta.id, NEW_ID);
+    assert!(event.xml_body.is_none(), "polled event must be meta-only");
 }
 
 /// フィードのetagが `from` から変わるまで待ち、新しいsnapshot本文を返す。
@@ -577,7 +426,7 @@ async fn poll_skips_id_already_delivered_via_ws() {
                 conn: 0,
             },
             dedup_key: DedupKey::TelegramId(NEW_ID.into()),
-            xml_body: Bytes::from_static(b"<Report>ws body</Report>"),
+            xml_body: Some(Bytes::from_static(b"<Report>ws body</Report>")),
             meta: ws_meta,
         })
         .await
@@ -605,4 +454,68 @@ async fn poll_skips_id_already_delivered_via_ws() {
         .map(|e| Arc::clone(e.value()))
         .expect("ws entry must stay pinned");
     assert_eq!(&entry.body[..], b"<Report>ws body</Report>");
+}
+
+#[tokio::test]
+async fn polled_entry_is_meta_only_until_first_access() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let server = MockServer::start().await;
+    let (state, rx, mut poller) = setup(&server).await;
+
+    // aggregatorを起動してpoll publish → feed反映 → 遅延取得まで通しで検証する
+    tokio::spawn(aggregator::run(Vec::new(), rx, state.clone()));
+    for _ in 0..100 {
+        if state.readiness.aggregator_running.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let etag0 = state.feed.load_full().etag.clone();
+
+    // poll中は実体エンドポイントを一切mountしない = pollerがfetchすれば失敗する
+    mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
+    let published = poller.poll_once(true).await.expect("poll must succeed");
+    assert_eq!(published, 1);
+
+    // feedへ反映されるが、meta-only: アローリスト在中・未pin
+    let feed_body = wait_for_feed_change(&state, &etag0).await;
+    assert!(feed_body.contains(NEW_ID));
+    assert!(state.feed_ids.contains(NEW_ID));
+    assert!(
+        state.pinned.get(NEW_ID).is_none(),
+        "polled entry must not be pinned before first access"
+    );
+
+    // 初回HTTPアクセス: CacheFill経路でちょうど1回だけ実体をfetchして200
+    mount_entity_once(&server, NEW_ID).await;
+    let router = jma_feed_gateway::http::build_router(state.clone());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/developer/xml/data/{NEW_ID}.xml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], entity_xml(NEW_ID).as_bytes());
+
+    // CacheFill Eventがaggregatorに処理され、feed在中IDとしてpinnedへ昇格する
+    let mut pinned = None;
+    for _ in 0..100 {
+        if let Some(entry) = state.pinned.get(NEW_ID).map(|e| Arc::clone(e.value())) {
+            pinned = Some(entry);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = pinned.expect("polled entry must be pinned after first access");
+    assert_eq!(&entry.body[..], entity_xml(NEW_ID).as_bytes());
+    // MockServer drop時に expect(1) が検証される(poller由来のfetchゼロの証明)
 }

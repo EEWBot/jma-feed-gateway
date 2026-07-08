@@ -215,7 +215,8 @@ pub struct AppState {
     /// 不変条件: キー集合 = aggregatorの `metas` のID集合。
     pub feed_ids: DashSet<String>,
     /// 外部リクエスト起因のアウトバウンドfetchのレートリミッタ(`[rate_limit]`)。
-    /// poller/warmupの内部fetchは対象外(entry_fetch_limitで制御済み)。
+    /// poll由来entryもmeta-onlyでpublishされるため、実体は初回アクセス時に
+    /// この制限下で遅延取得される。warmup(初期一覧)は実体を取得しないため対象外。
     pub fetch_limiter: RateLimiter,
     pub readiness: Readiness,
     /// DMDATA APIクライアント(warmup / キャッシュミス補充 / WS認可で共用)。

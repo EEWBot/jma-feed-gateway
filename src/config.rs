@@ -94,8 +94,6 @@ pub struct PollConfig {
     pub enabled: bool,
     /// 毎分この秒にpollする(壁時計基準、0〜59)。
     pub offset_secs: u64,
-    /// 1 tickで実体取得する最大entry数(バースト保護)。
-    pub entry_fetch_limit: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,11 +151,6 @@ impl Config {
         if self.poll.offset_secs >= 60 {
             return Err(ConfigError::Invalid("poll.offset_secs must be < 60".into()));
         }
-        if self.poll.entry_fetch_limit == 0 {
-            return Err(ConfigError::Invalid(
-                "poll.entry_fetch_limit must be > 0".into(),
-            ));
-        }
         if self.rate_limit.max_requests == 0 {
             return Err(ConfigError::Invalid(
                 "rate_limit.max_requests must be > 0".into(),
@@ -212,7 +205,6 @@ mod tests {
             assert_eq!(config.dmdata.retry_initial_backoff_ms, 1000);
             assert!(config.poll.enabled);
             assert_eq!(config.poll.offset_secs, 20);
-            assert_eq!(config.poll.entry_fetch_limit, 20);
             assert_eq!(config.rate_limit.max_requests, 40);
             assert_eq!(config.rate_limit.window_secs, 300);
             Ok(())
@@ -268,15 +260,6 @@ mod tests {
     fn invalid_poll_values_rejected() {
         figment::Jail::expect_with(|jail| {
             jail.set_env("JMA_FEED_GATEWAY__POLL__OFFSET_SECS", "60");
-            let result = Config::from_figment(
-                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
-                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
-            );
-            assert!(matches!(result, Err(ConfigError::Invalid(_))));
-            Ok(())
-        });
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("JMA_FEED_GATEWAY__POLL__ENTRY_FETCH_LIMIT", "0");
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),

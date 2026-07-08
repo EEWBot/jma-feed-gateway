@@ -158,7 +158,7 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
             conn: conn_index,
         },
         dedup_key,
-        xml_body,
+        xml_body: Some(xml_body),
         meta,
     }))
 }
@@ -371,11 +371,8 @@ mod tests {
                 conn: 1
             }
         );
-        assert!(
-            std::str::from_utf8(&event.xml_body)
-                .unwrap()
-                .contains("<Report")
-        );
+        let body = event.xml_body.as_ref().expect("ws event must carry a body");
+        assert!(std::str::from_utf8(body).unwrap().contains("<Report"));
     }
 
     #[test]

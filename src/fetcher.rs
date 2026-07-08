@@ -214,7 +214,7 @@ pub async fn fetch_entity(state: SharedState, id: String, result_tx: InflightTx)
     let event = Event {
         source: EventSource::CacheFill,
         dedup_key: DedupKey::composite(id.clone(), meta.updated.clone(), &body),
-        xml_body: body,
+        xml_body: Some(body),
         meta,
     };
     if state.event_tx.send(event).await.is_err() {

@@ -32,7 +32,7 @@ fn dmdata_event(telegram_id: &str, item: ItemMeta) -> Event {
             conn: 0,
         },
         dedup_key: DedupKey::TelegramId(telegram_id.into()),
-        xml_body: Bytes::from(format!("<Report>{}</Report>", item.id)),
+        xml_body: Some(Bytes::from(format!("<Report>{}</Report>", item.id))),
         meta: item,
     }
 }
@@ -182,7 +182,7 @@ async fn same_entry_id_with_telegram_key_is_dropped() {
         "t-stale",
         meta("id-a", "再着(重複)", "2026-07-05T04:12:00+09:00"),
     );
-    event.xml_body = Bytes::from_static(b"<Report>id-a v2</Report>");
+    event.xml_body = Some(Bytes::from_static(b"<Report>id-a v2</Report>"));
     tx.send(event).await.unwrap();
 
     // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
@@ -221,7 +221,7 @@ fn composite_event(item: ItemMeta, body: &'static [u8]) -> Event {
             conn: 0,
         },
         dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), body),
-        xml_body: Bytes::from_static(body),
+        xml_body: Some(Bytes::from_static(body)),
         meta: item,
     }
 }
@@ -403,7 +403,7 @@ fn cache_fill_event(item: ItemMeta, body: &'static [u8]) -> Event {
     Event {
         source: EventSource::CacheFill,
         dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), body),
-        xml_body: Bytes::from_static(body),
+        xml_body: Some(Bytes::from_static(body)),
         meta: item,
     }
 }
@@ -645,7 +645,7 @@ async fn same_id_resend_with_telegram_key_keeps_original_pin() {
     let mut item = meta("id-same", "更新後(重複)", "2026-07-05T04:12:00+09:00");
     item.content = "更新後の本文".into();
     let mut event = dmdata_event("t-second", item);
-    event.xml_body = bytes::Bytes::from_static(b"<Report>updated</Report>");
+    event.xml_body = Some(bytes::Bytes::from_static(b"<Report>updated</Report>"));
     tx.send(event).await.unwrap();
 
     // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
@@ -672,18 +672,19 @@ async fn same_id_resend_with_telegram_key_keeps_original_pin() {
     );
 }
 
-fn dmdata_poll_event(item: ItemMeta, body: &'static [u8]) -> Event {
+fn dmdata_poll_event(item: ItemMeta) -> Event {
     Event {
         source: EventSource::DmdataPoll,
         // pollerはWSと同じdmdata電文IDをdedupキーに使う
         dedup_key: DedupKey::TelegramId(item.id.clone()),
-        xml_body: Bytes::from_static(body),
+        // poll由来はmeta-only(実体は初回アクセス時に遅延取得)
+        xml_body: None,
         meta: item,
     }
 }
 
 #[tokio::test]
-async fn dmdata_poll_event_updates_feed_and_is_pinned() {
+async fn dmdata_poll_event_updates_feed_and_is_not_pinned() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
@@ -692,21 +693,42 @@ async fn dmdata_poll_event_updates_feed_and_is_pinned() {
         "poll由来の電文",
         "2026-07-05T04:10:00+09:00",
     );
-    tx.send(dmdata_poll_event(item, b"<Report>polled</Report>"))
-        .await
-        .unwrap();
+    tx.send(dmdata_poll_event(item)).await.unwrap();
 
     let body = wait_for_feed_change(&state, &etag0).await;
     assert!(body.contains("20260705041000_0_VXSE53_010000"));
     assert!(body.contains("poll由来の電文"));
 
-    // poll由来もdmdata同様pinnedに載る
-    let entry = state
-        .pinned
-        .get("20260705041000_0_VXSE53_010000")
-        .map(|e| Arc::clone(e.value()))
-        .expect("polled entry must be pinned");
-    assert_eq!(&entry.body[..], b"<Report>polled</Report>");
+    // poll由来はmeta-only — 実体未取得のため未pin、feed_ids(アローリスト)には在中
+    assert!(
+        state.pinned.get("20260705041000_0_VXSE53_010000").is_none(),
+        "polled entry must not be pinned before first access"
+    );
+    assert!(state.feed_ids.contains("20260705041000_0_VXSE53_010000"));
+
+    // ミス補充(CacheFill)が届くとpoll由来IDもpinnedへ昇格する
+    let item = meta(
+        "20260705041000_0_VXSE53_010000",
+        "poll由来の電文",
+        "2026-07-05T04:10:00+09:00",
+    );
+    tx.send(cache_fill_event(item, b"<Report>polled body</Report>"))
+        .await
+        .unwrap();
+    let mut pinned = None;
+    for _ in 0..100 {
+        if let Some(entry) = state
+            .pinned
+            .get("20260705041000_0_VXSE53_010000")
+            .map(|e| Arc::clone(e.value()))
+        {
+            pinned = Some(entry);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = pinned.expect("polled entry must be pinned after cache fill");
+    assert_eq!(&entry.body[..], b"<Report>polled body</Report>");
 }
 
 #[tokio::test]
@@ -720,9 +742,7 @@ async fn dmdata_event_with_same_telegram_id_as_polled_is_dropped() {
         "poll先行",
         "2026-07-05T04:10:00+09:00",
     );
-    tx.send(dmdata_poll_event(polled, b"<Report>poll body</Report>"))
-        .await
-        .unwrap();
+    tx.send(dmdata_poll_event(polled)).await.unwrap();
     wait_for_feed_change(&state, &etag0).await;
     let etag1 = state.feed.load_full().etag.clone();
 
@@ -751,13 +771,17 @@ async fn dmdata_event_with_same_telegram_id_as_polled_is_dropped() {
         !body.contains("WS再送(重複)"),
         "same-telegram-id dmdata event must be dropped by seen dedupe"
     );
-    // pinned本文もpoll由来のまま置き換わらない
-    let entry = state
-        .pinned
-        .get("SHARED_TELEGRAM_ID")
-        .map(|e| Arc::clone(e.value()))
-        .expect("polled entry must stay pinned");
-    assert_eq!(&entry.body[..], b"<Report>poll body</Report>");
+    // poll由来はmeta-onlyのまま(WS再送でpinされない)、feed順もpoll先行が保たれる
+    assert!(
+        state.pinned.get("SHARED_TELEGRAM_ID").is_none(),
+        "dropped ws resend must not pin the polled entry"
+    );
+    let pos_sentinel = body.find("id-sentinel").unwrap();
+    let pos_shared = body.find("SHARED_TELEGRAM_ID").unwrap();
+    assert!(
+        pos_sentinel < pos_shared,
+        "poll-first entry must keep its chronological position"
+    );
 }
 
 #[tokio::test]
@@ -771,7 +795,7 @@ async fn cache_fill_backfill_does_not_pollute_publish_dedupe() {
     tx.send(Event {
         source: EventSource::CacheFill,
         dedup_key: DedupKey::composite(backfill.id.clone(), backfill.updated.clone(), &body),
-        xml_body: body,
+        xml_body: Some(body),
         meta: backfill,
     })
     .await
@@ -795,7 +819,7 @@ async fn cache_fill_backfill_does_not_pollute_publish_dedupe() {
             "2026-07-05T04:10:00+09:00",
         ),
     );
-    event.xml_body = Bytes::from_static(b"<Report>shared body</Report>");
+    event.xml_body = Some(Bytes::from_static(b"<Report>shared body</Report>"));
     tx.send(event).await.unwrap();
 
     let feed_body = wait_for_feed_change(&state, &etag0).await;

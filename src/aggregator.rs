@@ -33,8 +33,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
             continue;
         }
 
-        // 実体キャッシュ更新(ETagは事前生成)
-        let entry = Arc::new(EntityEntry::new(event.xml_body.clone(), event.meta.clone()));
+        // 実体キャッシュ更新(ETagは事前生成)。poll由来はmeta-only(実体なし)のためNone
+        let entry = event
+            .xml_body
+            .map(|body| Arc::new(EntityEntry::new(body, event.meta.clone())));
 
         // キャッシュミス補充(CacheFill)由来は一覧を再生成しない。
         // fetch開始時はアローリスト通過済みだがその後evictされた可能性があるため、
@@ -42,6 +44,8 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         // TOCTOUなし): feed在中ならpinnedへ(不変条件「pinnedキー集合 ⊆ feed内ID」)、
         // feed外ならentities(moka)へ。
         if event.source == EventSource::CacheFill {
+            // 不変条件: CacheFillのEventはfetch_entityが常に実体を載せる
+            let entry = entry.expect("cache fill event must carry a body");
             if metas.iter().any(|m| m.id == event.meta.id) {
                 // or_insert: WS/poll経路で先に新しいbodyがpin済みなら上書きしない
                 state.pinned.entry(event.meta.id.clone()).or_insert(entry);
@@ -66,9 +70,14 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
             metas.remove(pos);
         }
 
-        // dmdata/poll由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
-        // 同一id再送は insert がArcを置換する。feed_ids(アローリスト)にも追加。
-        state.pinned.insert(event.meta.id.clone(), entry);
+        // 実体を持つWS由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
+        // poll由来はmeta-onlyのため未pinのまま — 実体は初回アクセス時の
+        // CacheFill経路(singleflight + rate limiter)で遅延取得されpinへ昇格する。
+        // 同一id再送は insert がArcを置換する。feed_ids(アローリスト)は
+        // 遅延取得の許可条件になるため実体の有無に関わらず無条件で追加する。
+        if let Some(entry) = entry {
+            state.pinned.insert(event.meta.id.clone(), entry);
+        }
         state.feed_ids.insert(event.meta.id.clone());
 
         tracing::info!(id = %event.meta.id, title = %event.meta.title, "feed entry added");

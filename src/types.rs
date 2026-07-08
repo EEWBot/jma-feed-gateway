@@ -28,7 +28,8 @@ pub enum EventSource {
     /// キャッシュミス補充(dmdata telegram.data)由来。一覧は再生成しない。
     CacheFill,
     /// 全WS切断中のfallback polling(dmdata telegram.list)由来。
-    /// dmdata電文IDを持ち、WS由来と同じpinned+publish経路に載る。
+    /// dmdata電文IDを持つがmeta-only(実体なし)でpublishされ、
+    /// 実体は初回アクセス時にCacheFill経路で遅延取得される。
     DmdataPoll,
 }
 
@@ -64,8 +65,9 @@ impl DedupKey {
 pub struct Event {
     pub source: EventSource,
     pub dedup_key: DedupKey,
-    /// 展開済みXML実体。
-    pub xml_body: Bytes,
+    /// 展開済みXML実体。WS / CacheFill 由来は `Some`、poll由来はmeta-only(`None`)。
+    /// `None` のentryの実体は初回アクセス時にCacheFill経路で遅延取得される。
+    pub xml_body: Option<Bytes>,
     pub meta: ItemMeta,
 }
 
