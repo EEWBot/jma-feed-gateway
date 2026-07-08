@@ -163,13 +163,77 @@ async fn duplicate_dedup_key_is_dropped() {
 }
 
 #[tokio::test]
-async fn same_entry_id_is_replaced_and_moved_to_front() {
+async fn same_entry_id_with_telegram_key_is_dropped() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
     tx.send(dmdata_event(
         "t-a",
-        meta("id-a", "更新前", "2026-07-05T04:10:00+09:00"),
+        meta("id-a", "初報", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let etag1 = state.feed.load_full().etag.clone();
+
+    // 同一entry idの再着(別電文ID・TelegramIdキー)= seen TTL失効後の
+    // 古い電文の再publishに相当 → dropされフィードは変わらない
+    let mut event = dmdata_event(
+        "t-stale",
+        meta("id-a", "再着(重複)", "2026-07-05T04:12:00+09:00"),
+    );
+    event.xml_body = Bytes::from_static(b"<Report>id-a v2</Report>");
+    tx.send(event).await.unwrap();
+
+    // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
+    tx.send(dmdata_event(
+        "t-sentinel",
+        meta("id-sentinel", "番兵", "2026-07-05T04:13:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    assert!(body.contains("id-sentinel"));
+    assert!(body.contains("初報"));
+    assert!(
+        !body.contains("再着(重複)"),
+        "same-entry-id telegram-key event must be dropped"
+    );
+    assert_eq!(
+        body.matches("id-a.xml").count(),
+        2,
+        "id + link で2回のみ(1entry)"
+    );
+    // pinned本文も置き換わらない
+    let entry = state
+        .pinned
+        .get("id-a")
+        .map(|e| Arc::clone(e.value()))
+        .expect("original entry must stay pinned");
+    assert_eq!(&entry.body[..], b"<Report>id-a</Report>");
+}
+
+fn composite_event(item: ItemMeta, body: &'static [u8]) -> Event {
+    Event {
+        // WS空IDフォールバック(合成ID)経路を模擬
+        source: EventSource::Dmdata {
+            telegram_id: String::new(),
+            conn: 0,
+        },
+        dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), body),
+        xml_body: Bytes::from_static(body),
+        meta: item,
+    }
+}
+
+#[tokio::test]
+async fn composite_key_same_entry_id_is_replaced_and_moved_to_front() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(composite_event(
+        meta("id-x", "更新前", "2026-07-05T04:10:00+09:00"),
+        b"<Report>id-x v1</Report>",
     ))
     .await
     .unwrap();
@@ -177,30 +241,136 @@ async fn same_entry_id_is_replaced_and_moved_to_front() {
     let etag1 = state.feed.load_full().etag.clone();
 
     tx.send(dmdata_event(
-        "t-b",
-        meta("id-b", "別entry", "2026-07-05T04:11:00+09:00"),
+        "t-other",
+        meta("id-other", "別entry", "2026-07-05T04:11:00+09:00"),
     ))
     .await
     .unwrap();
     wait_for_feed_change(&state, &etag1).await;
     let etag2 = state.feed.load_full().etag.clone();
 
-    // id-a を更新 → 置換され先頭へ、重複entryなし
-    // (実際の内容更新どおり別本文にする)
-    let mut event = dmdata_event("t-c", meta("id-a", "更新後", "2026-07-05T04:12:00+09:00"));
-    event.xml_body = Bytes::from_static(b"<Report>id-a v2</Report>");
-    tx.send(event).await.unwrap();
+    // Compositeキーの同一entry id再着は正当な更新 → 置換され先頭へ
+    tx.send(composite_event(
+        meta("id-x", "更新後", "2026-07-05T04:12:00+09:00"),
+        b"<Report>id-x v2</Report>",
+    ))
+    .await
+    .unwrap();
     let body = wait_for_feed_change(&state, &etag2).await;
     assert!(body.contains("更新後"));
     assert!(!body.contains("更新前"));
     assert_eq!(
-        body.matches("id-a.xml").count(),
+        body.matches("id-x.xml").count(),
         2,
         "id + link で2回のみ(1entry)"
     );
-    let first_a = body.find("id-a").unwrap();
-    let first_b = body.find("id-b").unwrap();
-    assert!(first_a < first_b, "updated entry must be at front");
+    let first_x = body.find("id-x").unwrap();
+    let first_other = body.find("id-other").unwrap();
+    assert!(first_x < first_other, "updated entry must be at front");
+    let entry = state
+        .pinned
+        .get("id-x")
+        .map(|e| Arc::clone(e.value()))
+        .unwrap();
+    assert_eq!(&entry.body[..], b"<Report>id-x v2</Report>");
+}
+
+#[tokio::test]
+async fn preseeded_deduper_drops_event() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    // 起動時seed(warmup済み電文ID)を模擬
+    state
+        .deduper
+        .insert(DedupKey::TelegramId("t-seeded".into()));
+
+    tx.send(dmdata_event(
+        "t-seeded",
+        meta("id-seeded", "seed済み(重複)", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
+    tx.send(dmdata_event(
+        "t-sentinel",
+        meta("id-sentinel", "番兵", "2026-07-05T04:11:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag0).await;
+    assert!(body.contains("id-sentinel"));
+    assert!(
+        !body.contains("id-seeded"),
+        "pre-seeded telegram id must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn late_event_with_older_updated_is_inserted_in_chronological_position() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(dmdata_event(
+        "t-new",
+        meta("id-new", "新しい電文", "2026-07-05T04:20:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let etag1 = state.feed.load_full().etag.clone();
+
+    // catch-up pollの遅延publish(WSが先に新しい電文を配信済み)を模擬:
+    // 古いupdatedのentryは先頭でなく時系列位置に入る
+    tx.send(dmdata_event(
+        "t-old",
+        meta("id-old", "取り逃し分", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    let pos_new = body.find("id-new").unwrap();
+    let pos_old = body.find("id-old").unwrap();
+    assert!(
+        pos_new < pos_old,
+        "older-updated entry must not jump to front"
+    );
+    // feed <updated>(先頭entry)は最大値のまま
+    assert_eq!(
+        state.feed.load_full().last_updated,
+        "2026-07-05T04:20:00+09:00"
+    );
+}
+
+#[tokio::test]
+async fn ascending_arrival_keeps_newest_at_front() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(dmdata_event(
+        "t-1",
+        meta("id-1", "一通目", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let etag1 = state.feed.load_full().etag.clone();
+
+    // 通常のWSフロー(最新が最後に届く)では従来どおり先頭に積まれる
+    tx.send(dmdata_event(
+        "t-2",
+        meta("id-2", "二通目", "2026-07-05T04:11:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    let pos_1 = body.find("id-1").unwrap();
+    let pos_2 = body.find("id-2").unwrap();
+    assert!(pos_2 < pos_1, "newest entry must be at front");
+    assert_eq!(
+        state.feed.load_full().last_updated,
+        "2026-07-05T04:11:00+09:00"
+    );
 }
 
 #[tokio::test]
@@ -354,7 +524,7 @@ async fn warmup_entries_are_never_pinned() {
 }
 
 #[tokio::test]
-async fn same_id_resend_replaces_pin() {
+async fn same_id_resend_with_telegram_key_keeps_original_pin() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
@@ -367,21 +537,35 @@ async fn same_id_resend_replaces_pin() {
     wait_for_feed_change(&state, &etag0).await;
     let etag1 = state.feed.load_full().etag.clone();
 
-    // 同一entry idの再送(dedupキーは別)→ ピンはArc置換され1件のまま
-    let mut item = meta("id-same", "更新後", "2026-07-05T04:12:00+09:00");
+    // 同一entry idの再送(別電文ID・TelegramIdキー)→ dropされピンも不変
+    let mut item = meta("id-same", "更新後(重複)", "2026-07-05T04:12:00+09:00");
     item.content = "更新後の本文".into();
     let mut event = dmdata_event("t-second", item);
     event.xml_body = bytes::Bytes::from_static(b"<Report>updated</Report>");
     tx.send(event).await.unwrap();
-    wait_for_feed_change(&state, &etag1).await;
 
-    assert_eq!(state.pinned.len(), 1, "same-id resend must replace the pin");
+    // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
+    tx.send(dmdata_event(
+        "t-sentinel2",
+        meta("id-sentinel2", "番兵", "2026-07-05T04:13:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    assert!(body.contains("id-sentinel2"));
+    assert!(!body.contains("更新後(重複)"));
+
+    assert_eq!(state.pinned.len(), 2, "sentinel + original pin");
     let entry = state
         .pinned
         .get("id-same")
         .map(|e| Arc::clone(e.value()))
         .unwrap();
-    assert_eq!(&entry.body[..], b"<Report>updated</Report>");
+    assert_eq!(
+        &entry.body[..],
+        b"<Report>id-same</Report>",
+        "same-id telegram-key resend must not replace the pin"
+    );
 }
 
 fn dmdata_poll_event(item: ItemMeta, body: &'static [u8]) -> Event {
@@ -478,11 +662,7 @@ async fn cache_fill_backfill_does_not_pollute_publish_dedupe() {
     let etag0 = state.feed.load_full().etag.clone();
 
     // キャッシュミス補充(CacheFill)が先に流れる(dedupキーはComposite)
-    let backfill = meta(
-        "SHARED_TELEGRAM_ID",
-        "補充",
-        "2026-07-05T04:10:00+09:00",
-    );
+    let backfill = meta("SHARED_TELEGRAM_ID", "補充", "2026-07-05T04:10:00+09:00");
     let body = Bytes::from_static(b"<Report>shared body</Report>");
     tx.send(Event {
         source: EventSource::CacheFill,
@@ -505,7 +685,11 @@ async fn cache_fill_backfill_does_not_pollute_publish_dedupe() {
     // — CompositeとTelegramIdはvariantが異なり衝突しない
     let mut event = dmdata_event(
         "SHARED_TELEGRAM_ID",
-        meta("SHARED_TELEGRAM_ID", "正規配信", "2026-07-05T04:10:00+09:00"),
+        meta(
+            "SHARED_TELEGRAM_ID",
+            "正規配信",
+            "2026-07-05T04:10:00+09:00",
+        ),
     );
     event.xml_body = Bytes::from_static(b"<Report>shared body</Report>");
     tx.send(event).await.unwrap();
@@ -533,7 +717,7 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
     let lm1 = snapshot1.last_modified.expect("last_modified must be set");
     let etag1 = snapshot1.etag.clone();
 
-    // より古いupdatedのイベント(訂正報のReportDateTime逆順を模擬)が先頭に来ても
+    // より古いupdatedのイベント(訂正報のReportDateTime逆順を模擬)が届いても
     // Last-Modified は後退しない
     tx.send(dmdata_event(
         "t-early",
@@ -547,8 +731,8 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
     let snapshot2 = state.feed.load_full();
     let lm2 = snapshot2.last_modified.expect("last_modified must be set");
     assert_eq!(lm2, lm1, "last_modified must not regress");
-    // feed本文の<updated>は従来どおり先頭entryの値(=古い方)のまま
-    assert_eq!(snapshot2.last_updated, "2026-07-05T04:15:00+09:00");
+    // 順序挿入により古いentryは先頭に来ない → feed本文の<updated>(先頭entry)は最大値のまま
+    assert_eq!(snapshot2.last_updated, "2026-07-05T04:20:00+09:00");
     // HTTP用文字列も事前計算されている
     assert_eq!(
         snapshot2.last_modified_http.as_deref(),

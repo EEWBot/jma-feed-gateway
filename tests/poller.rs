@@ -1,6 +1,8 @@
 //! Pollerの統合テスト: wiremockでdmdata(telegram.list / telegram.data)を模擬し、
-//! poll_once の watermark / pending持ち越し / dedup / readiness遷移を検証する。
-//! 壁時計ループ(run)はテスト対象外(tokio::time::pause は now_utc を動かせない)。
+//! poll_once の候補フィルタ / backlog契約 / readiness遷移 / catch-upを検証する。
+//! pollerはseen登録しないため、tick間で受信IDを `state.deduper` へ挿入して
+//! aggregatorを模擬する。壁時計ループ(run)はテスト対象外
+//! (tokio::time::pause は now_utc を動かせない)。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,7 +20,7 @@ use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::poller::Poller;
 use jma_feed_gateway::state::{AppState, SharedState};
-use jma_feed_gateway::types::{DedupKey, Event, EventSource, FeedSnapshot, ItemMeta};
+use jma_feed_gateway::types::{DedupKey, EntityEntry, Event, EventSource, ItemMeta};
 
 const LIST_PATH: &str = "/telegram";
 const OLD_ID: &str = "TELEGRAM_OLD_VXSE53_0000000000000000000000000000000000000000";
@@ -102,8 +104,23 @@ async fn mount_entity(server: &MockServer, id: &str) {
         .await;
 }
 
+/// 実体が一切fetchされないことを検証するモックを登録する。
+async fn mount_entity_never(server: &MockServer, id: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/{id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(entity_xml(id)))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// aggregatorによるseen登録を模擬する(pollerはseen登録しない)。
+fn mark_delivered(state: &SharedState, id: &str) {
+    state.deduper.insert(DedupKey::TelegramId(id.into()));
+}
+
 #[tokio::test]
-async fn first_poll_publishes_then_seen_dedups_next_tick() {
+async fn first_poll_publishes_then_deduper_skips_next_tick() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
@@ -121,9 +138,13 @@ async fn first_poll_publishes_then_seen_dedups_next_tick() {
     mount_entity(&server, NEW_ID).await;
     mount_entity(&server, OLD_ID).await;
 
-    // 初回poll: watermark無し(空スナップショット)→ 2件ともupdated昇順でpublish
-    let published = poller.poll_once().await.expect("first poll must succeed");
+    // 初回poll: 2件ともupdated昇順でpublish
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("first poll must succeed");
     assert_eq!(published, 2);
+    assert!(!poller.has_backlog());
 
     let first = rx.try_recv().expect("oldest entry must be published first");
     assert_eq!(first.meta.id, OLD_ID);
@@ -137,45 +158,41 @@ async fn first_poll_publishes_then_seen_dedups_next_tick() {
     assert_eq!(second.source, EventSource::DmdataPoll);
     assert!(rx.try_recv().is_err());
 
-    // 2回目poll: 同じリストだがseen済み → 何もpublishしない
-    let published = poller.poll_once().await.expect("second poll must succeed");
+    // aggregatorがseen登録した状況を模擬
+    mark_delivered(&state, OLD_ID);
+    mark_delivered(&state, NEW_ID);
+
+    // 2回目poll: 同じリストだがdeduper既知 → 何もpublishしない
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("second poll must succeed");
     assert_eq!(published, 0);
     assert!(rx.try_recv().is_err());
     assert!(state.readiness.poll_active.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
-async fn entries_older_than_watermark_are_not_fetched() {
+async fn deduper_known_id_is_not_fetched() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
-    // watermark = 2026-07-05T04:10:00+09:00(aggregatorが設定する想定の値を模擬)
-    let watermark = time::macros::datetime!(2026-07-04 19:10:00 UTC);
-    state.feed.store(Arc::new(FeedSnapshot::new(
-        Bytes::new(),
-        "2026-07-05T04:10:00+09:00".into(),
-        Some(watermark),
-    )));
+    // OLD_IDはpublish済み(WS/warmup由来を模擬)
+    mark_delivered(&state, OLD_ID);
 
     mount_list(
         &server,
         &[
             (NEW_ID, "2026-07-05T04:11:00+09:00"),
-            // watermark - slack(600s) より古い → 既配信としてfetchしない
             (OLD_ID, "2026-07-05T03:50:00+09:00"),
         ],
     )
     .await;
     mount_entity(&server, NEW_ID).await;
-    // 古いentryの実体は一切リクエストされないこと
-    Mock::given(method("GET"))
-        .and(path(format!("/v1/{OLD_ID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(entity_xml(OLD_ID)))
-        .expect(0)
-        .mount(&server)
-        .await;
+    // deduper既知のentryの実体は一切リクエストされないこと
+    mount_entity_never(&server, OLD_ID).await;
 
-    let published = poller.poll_once().await.expect("poll must succeed");
+    let published = poller.poll_once(true).await.expect("poll must succeed");
     assert_eq!(published, 1);
     let event = rx.try_recv().unwrap();
     assert_eq!(event.meta.id, NEW_ID);
@@ -183,18 +200,44 @@ async fn entries_older_than_watermark_are_not_fetched() {
     // MockServer drop時に expect(0) が検証される
 }
 
-/// aggregatorによるwatermark前進を模擬する(NEW_IDのpublish後の値)。
-fn advance_watermark_to_new(state: &SharedState) {
-    state.feed.store(Arc::new(FeedSnapshot::new(
-        Bytes::new(),
-        "2026-07-05T04:11:00+09:00".into(),
-        // = NEW_IDのupdated。OLD_ID(03:50)はこれよりslack(600s)以上古い
-        Some(time::macros::datetime!(2026-07-04 19:11:00 UTC)),
-    )));
+#[tokio::test]
+async fn pinned_id_is_not_fetched() {
+    let server = MockServer::start().await;
+    let (state, mut rx, mut poller) = setup(&server).await;
+
+    // OLD_IDはfeed在中(pinned)— seen TTL失効後もfetchしない
+    let meta = ItemMeta {
+        id: OLD_ID.into(),
+        updated: "2026-07-05T03:50:00+09:00".into(),
+        ..ItemMeta::default()
+    };
+    state.pinned.insert(
+        OLD_ID.into(),
+        Arc::new(EntityEntry::new(
+            Bytes::from_static(b"<Report>pinned</Report>"),
+            meta,
+        )),
+    );
+
+    mount_list(
+        &server,
+        &[
+            (NEW_ID, "2026-07-05T04:11:00+09:00"),
+            (OLD_ID, "2026-07-05T03:50:00+09:00"),
+        ],
+    )
+    .await;
+    mount_entity(&server, NEW_ID).await;
+    mount_entity_never(&server, OLD_ID).await;
+
+    let published = poller.poll_once(true).await.expect("poll must succeed");
+    assert_eq!(published, 1);
+    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn failed_entity_survives_watermark_advance_and_is_retried() {
+async fn fetch_failure_sets_backlog_and_entry_is_republished_next_tick() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
@@ -217,29 +260,40 @@ async fn failed_entity_survives_watermark_advance_and_is_retried() {
     mount_entity(&server, OLD_ID).await;
     mount_entity(&server, NEW_ID).await;
 
-    // 初回: OLDのfetch失敗(→pending)、NEWはpublish
-    let published = poller.poll_once().await.expect("first poll must succeed");
+    // 初回: OLDのfetch失敗 → backlog=true、NEWはpublish
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("first poll must succeed");
     assert_eq!(published, 1);
+    assert!(poller.has_backlog());
     assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
     assert!(rx.try_recv().is_err());
 
-    // NEWのpublishによりaggregatorがwatermarkを前進させた状況を模擬。
-    // OLDはwatermark-slackより古い → watermark再選別に通すと永久喪失する
-    advance_watermark_to_new(&state);
+    mark_delivered(&state, NEW_ID);
 
-    // 2回目: pendingはwatermarkをバイパスして再fetchされpublish
-    let published = poller.poll_once().await.expect("retry poll must succeed");
+    // 2回目: OLDがリストから自然に再選別され publish、クリーンtickでbacklogクリア
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("retry poll must succeed");
     assert_eq!(published, 1);
+    assert!(!poller.has_backlog());
     assert_eq!(rx.try_recv().unwrap().meta.id, OLD_ID);
 
-    // 3回目: 全件seen済み → 何もpublishしない
-    let published = poller.poll_once().await.expect("third poll must succeed");
+    mark_delivered(&state, OLD_ID);
+
+    // 3回目: 全件deduper既知 → 何もpublishしない
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("third poll must succeed");
     assert_eq!(published, 0);
     assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn deferred_candidates_survive_watermark_advance() {
+async fn over_limit_candidates_are_dropped_and_published_next_tick() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup_with(&server, |c| c.poll.entry_fetch_limit = 1).await;
 
@@ -254,27 +308,30 @@ async fn deferred_candidates_survive_watermark_advance() {
     mount_entity(&server, NEW_ID).await;
     mount_entity(&server, OLD_ID).await;
 
-    // 初回: 上限1件 → 最新のみpublish、古い側はpendingへ
-    let published = poller.poll_once().await.expect("first poll must succeed");
+    // 初回: 上限1件 → 最新のみpublish、古い側は単に落として backlog=true
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("first poll must succeed");
     assert_eq!(published, 1);
+    assert!(poller.has_backlog());
     assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
     assert!(rx.try_recv().is_err());
 
-    // watermark前進を模擬(OLDはwatermark-slackより古い)
-    advance_watermark_to_new(&state);
+    mark_delivered(&state, NEW_ID);
 
-    // 2回目: pendingがwatermarkをバイパスしてpublishされる
-    let published = poller.poll_once().await.expect("second poll must succeed");
+    // 2回目: 落とした分がリストから再選別されpublish
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("second poll must succeed");
     assert_eq!(published, 1);
+    assert!(!poller.has_backlog());
     assert_eq!(rx.try_recv().unwrap().meta.id, OLD_ID);
-
-    // 3回目: 全件seen済み → 何もpublishしない
-    let published = poller.poll_once().await.expect("third poll must succeed");
-    assert_eq!(published, 0);
 }
 
 #[tokio::test]
-async fn pending_is_drained_while_ws_connected() {
+async fn backlog_drain_while_ws_connected_does_not_set_poll_active() {
     let server = MockServer::start().await;
     let (state, mut rx, mut poller) = setup(&server).await;
 
@@ -289,26 +346,31 @@ async fn pending_is_drained_while_ws_connected() {
         .await;
     mount_entity(&server, NEW_ID).await;
 
-    // アウトエージ中の初回poll: fetch失敗 → pending
-    let published = poller.poll_once().await.expect("poll must succeed");
-    assert_eq!(published, 0);
-    assert!(rx.try_recv().is_err());
-
-    // WS復帰(run()がpollをスキップするtick)でもpendingは処理し切る —
-    // WSは切断中に発行された電文を再配信しない
+    // WS接続中(fallback=false)のtickでfetch失敗 → backlog=true、poll_activeは不変
     state.readiness.ws_connected[0].store(true, Ordering::Relaxed);
-    poller.drain_pending().await;
-    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    let published = poller.poll_once(false).await.expect("poll must succeed");
+    assert_eq!(published, 0);
+    assert!(poller.has_backlog());
+    assert!(!state.readiness.poll_active.load(Ordering::Relaxed));
 
-    // pending空なら何もしない
-    poller.drain_pending().await;
-    assert!(rx.try_recv().is_err());
+    // WS接続中のbacklog消化 — WSは切断中に発行された電文を再配信しない
+    let published = poller
+        .poll_once(false)
+        .await
+        .expect("drain poll must succeed");
+    assert_eq!(published, 1);
+    assert!(!poller.has_backlog());
+    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    assert!(
+        !state.readiness.poll_active.load(Ordering::Relaxed),
+        "backlog drain while ws connected must not set poll_active"
+    );
 }
 
 #[tokio::test]
-async fn pending_gone_from_list_is_dropped() {
+async fn backlog_clears_when_item_vanishes_from_list() {
     let server = MockServer::start().await;
-    let (_state, mut rx, mut poller) = setup(&server).await;
+    let (state, mut rx, mut poller) = setup(&server).await;
 
     // 初回リスト: OLD(恒久500)+ NEW
     Mock::given(method("GET"))
@@ -331,19 +393,25 @@ async fn pending_gone_from_list_is_dropped() {
         .await;
     mount_entity(&server, NEW_ID).await;
 
-    // 初回: NEW publish、OLDは失敗しpendingへ
-    let published = poller.poll_once().await.expect("first poll must succeed");
+    // 初回: NEW publish、OLDは失敗 → backlog=true
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("first poll must succeed");
     assert_eq!(published, 1);
+    assert!(poller.has_backlog());
     assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
 
-    // 2回目: OLDがリスト一覧から消えた → pendingから破棄され再fetchされない
-    let published = poller.poll_once().await.expect("second poll must succeed");
-    assert_eq!(published, 0);
-    assert!(rx.try_recv().is_err());
+    mark_delivered(&state, NEW_ID);
 
-    // 3回目: pending空 + 全件seen済み → 何もpublishしない
-    let published = poller.poll_once().await.expect("third poll must succeed");
+    // 2回目: OLDがリストから消えた → 候補ゼロのクリーンtickでbacklogクリア
+    let published = poller
+        .poll_once(true)
+        .await
+        .expect("second poll must succeed");
     assert_eq!(published, 0);
+    assert!(!poller.has_backlog());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -367,14 +435,103 @@ async fn poll_active_transitions_with_poll_result() {
         .await;
 
     // 成功(publishゼロでも)→ poll_active = true
-    poller.poll_once().await.expect("first poll must succeed");
+    poller
+        .poll_once(true)
+        .await
+        .expect("first poll must succeed");
     assert!(state.readiness.poll_active.load(Ordering::Relaxed));
     assert!(state.readiness.snapshot().poll);
 
-    // 失敗 → poll_active = false
-    poller.poll_once().await.expect_err("second poll must fail");
+    // 失敗 → poll_active = false + backlog=true(次tickがリトライを担う)
+    poller
+        .poll_once(true)
+        .await
+        .expect_err("second poll must fail");
     assert!(!state.readiness.poll_active.load(Ordering::Relaxed));
     assert!(!state.readiness.snapshot().poll);
+    assert!(poller.has_backlog());
+}
+
+#[tokio::test]
+async fn catch_up_after_recovery_publishes_only_missed_entry() {
+    let server = MockServer::start().await;
+    let (state, mut rx, mut poller) = setup(&server).await;
+
+    // 切断前にWSが配信済みの電文(aggregatorのseen登録を模擬)
+    mark_delivered(&state, OLD_ID);
+
+    // 全断エピソード → 復帰。通知が積まれていること(run loopのselect相当)
+    state.readiness.mark_ws_connected(0);
+    state.readiness.mark_ws_disconnected(0);
+    state.readiness.mark_ws_connected(0);
+    tokio::time::timeout(
+        Duration::from_millis(10),
+        state.readiness.ws_recovered.notified(),
+    )
+    .await
+    .expect("recovery must be notified");
+
+    // 切断中に発行された電文NEWがリストに現れている
+    mount_list(
+        &server,
+        &[
+            (NEW_ID, "2026-07-05T04:11:00+09:00"),
+            (OLD_ID, "2026-07-05T03:50:00+09:00"),
+        ],
+    )
+    .await;
+    mount_entity(&server, NEW_ID).await;
+    // 配信済み分はfetchされない
+    mount_entity_never(&server, OLD_ID).await;
+
+    // catch-up poll(WS接続中なので fallback=false)
+    let published = poller
+        .poll_once(false)
+        .await
+        .expect("catch-up poll must succeed");
+    assert_eq!(published, 1);
+    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
+    assert!(rx.try_recv().is_err());
+    assert!(
+        !state.readiness.poll_active.load(Ordering::Relaxed),
+        "catch-up must not set poll_active"
+    );
+}
+
+#[tokio::test]
+async fn catch_up_list_failure_sets_backlog_for_retry() {
+    let server = MockServer::start().await;
+    let (state, mut rx, mut poller) = setup(&server).await;
+
+    // catch-upのlist取得: 初回だけ500、以降200
+    Mock::given(method("GET"))
+        .and(path(LIST_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_list(&server, &[(NEW_ID, "2026-07-05T04:11:00+09:00")]).await;
+    mount_entity(&server, NEW_ID).await;
+
+    state.readiness.ws_connected[0].store(true, Ordering::Relaxed);
+
+    // catch-up失敗 → backlog=true(毎分tickがWS接続中でもリトライする根拠)
+    poller
+        .poll_once(false)
+        .await
+        .expect_err("catch-up poll must fail");
+    assert!(poller.has_backlog());
+    assert!(!state.readiness.poll_active.load(Ordering::Relaxed));
+
+    // 次tick(backlogがあるのでWS接続中でもpoll)で取り逃し分がpublishされる
+    let published = poller
+        .poll_once(false)
+        .await
+        .expect("retry poll must succeed");
+    assert_eq!(published, 1);
+    assert!(!poller.has_backlog());
+    assert_eq!(rx.try_recv().unwrap().meta.id, NEW_ID);
 }
 
 /// フィードのetagが `from` から変わるまで待ち、新しいsnapshot本文を返す。
@@ -390,11 +547,11 @@ async fn wait_for_feed_change(state: &SharedState, from: &str) -> String {
 }
 
 #[tokio::test]
-async fn poll_delivered_id_already_seen_from_ws_is_deduped() {
+async fn poll_skips_id_already_delivered_via_ws() {
     let server = MockServer::start().await;
     let (state, rx, mut poller) = setup(&server).await;
 
-    // aggregatorを起動してWS由来 → poll由来のdedupを通しで検証する
+    // aggregatorを起動してWS由来 → poll候補フィルタを通しで検証する
     tokio::spawn(aggregator::run(Vec::new(), rx, state.clone()));
     for _ in 0..100 {
         if state.readiness.aggregator_running.load(Ordering::Relaxed) {
@@ -425,12 +582,10 @@ async fn poll_delivered_id_already_seen_from_ws_is_deduped() {
         })
         .await
         .unwrap();
-    let etag1 = {
-        wait_for_feed_change(&state, &etag0).await;
-        state.feed.load_full().etag.clone()
-    };
+    wait_for_feed_change(&state, &etag0).await;
 
-    // pollが同じ電文IDを配信(タイトルを変えて到達検知できるようにする)
+    // pollは共有deduper(aggregatorが登録済み)の事前フィルタでskipし、
+    // 実体fetchもpublishもしない
     let mut body = list_body(&[(NEW_ID, "2026-07-05T04:11:00+09:00")]);
     body["items"][0]["xmlReport"]["control"]["title"] = serde_json::json!("poll再送(重複)");
     Mock::given(method("GET"))
@@ -438,38 +593,11 @@ async fn poll_delivered_id_already_seen_from_ws_is_deduped() {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
-    mount_entity(&server, NEW_ID).await;
+    mount_entity_never(&server, NEW_ID).await;
 
-    let published = poller.poll_once().await.expect("poll must succeed");
-    // pollerはpublishするが、aggregatorが同一TelegramIdとしてdropする
-    assert_eq!(published, 1);
+    let published = poller.poll_once(true).await.expect("poll must succeed");
+    assert_eq!(published, 0);
 
-    // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
-    state
-        .event_tx
-        .send(Event {
-            source: EventSource::Dmdata {
-                telegram_id: "TELEGRAM_SENTINEL".into(),
-                conn: 0,
-            },
-            dedup_key: DedupKey::TelegramId("TELEGRAM_SENTINEL".into()),
-            xml_body: Bytes::from_static(b"<Report>sentinel</Report>"),
-            meta: ItemMeta {
-                id: "TELEGRAM_SENTINEL".into(),
-                title: "番兵".into(),
-                updated: "2026-07-05T04:12:00+09:00".into(),
-                author: "気象庁".into(),
-                content: "本文".into(),
-            },
-        })
-        .await
-        .unwrap();
-    let feed_body = wait_for_feed_change(&state, &etag1).await;
-    assert!(feed_body.contains("番兵"));
-    assert!(
-        !feed_body.contains("poll再送(重複)"),
-        "poll event with ws-seen telegram id must be dropped"
-    );
     // pinned本文もWS由来のまま置き換わらない
     let entry = state
         .pinned

@@ -50,8 +50,6 @@ enabled = true
 offset_secs = 20
 # 1 tickで実体取得する最大entry数(バースト保護)
 entry_fetch_limit = 20
-# ReportDateTime逆順の訂正報を取りこぼさないための遡り猶予(秒)
-watermark_slack_secs = 600
 
 [cache]
 # Atomフィードに保持する最大entry数

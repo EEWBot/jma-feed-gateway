@@ -5,40 +5,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::jma::feed_render;
 use crate::state::SharedState;
 use crate::types::{DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta};
-
-/// 重複排除。TTL付きのseenキャッシュ。
-/// キーはソース固有ID(dmdata電文ID等)。WS / poll / warmupの全経路が同一の
-/// dmdata電文IDを持つため、これだけでクロス経路dedupeが成立する。
-pub struct Deduper {
-    seen: moka::sync::Cache<DedupKey, ()>,
-}
-
-impl Deduper {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            seen: moka::sync::Cache::builder()
-                .max_capacity(65_536)
-                .time_to_live(ttl)
-                .build(),
-        }
-    }
-
-    /// 未見なら登録して true、既見なら false。
-    pub fn check_and_insert(&self, key: &DedupKey) -> bool {
-        if self.seen.contains_key(key) {
-            return false;
-        }
-        self.seen.insert(key.clone(), ());
-        true
-    }
-}
 
 /// Aggregatorタスク本体。`initial_metas` は起動時の初期一覧(新しい順)。
 pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, state: SharedState) {
@@ -48,7 +20,6 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
     let mut metas: VecDeque<ItemMeta> = initial_metas.into_iter().take(capacity).collect();
     publish(&state, &mut metas, &base_url);
 
-    let deduper = Deduper::new(Duration::from_secs(state.config.cache.seen_ttl_secs));
     state
         .readiness
         .aggregator_running
@@ -56,7 +27,8 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
     tracing::info!(entries = metas.len(), "aggregator started");
 
     while let Some(event) = rx.recv().await {
-        if !deduper.check_and_insert(&event.dedup_key) {
+        // dedupは共有Deduperで判定する(書き込みはここのみ、pollerは事前フィルタで読むだけ)
+        if !state.deduper.check_and_insert(&event.dedup_key) {
             tracing::debug!(id = %event.meta.id, "duplicate event dropped");
             continue;
         }
@@ -71,16 +43,33 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
             continue;
         }
 
+        // 同一entry idの再着: TelegramIdキーなら同一電文の重複で確定
+        // (dmdata電文IDは電文ごとに一意・訂正報は新ID)なのでdrop。
+        // seen TTL失効後もリストページに残る古い電文の再publishによる
+        // 順序破壊を防ぐ。Compositeキー(WS空IDフォールバックの合成ID経路)
+        // のみ正当な「同一entry id・別本文」更新として置換する。
+        if let Some(pos) = metas.iter().position(|m| m.id == event.meta.id) {
+            if matches!(event.dedup_key, DedupKey::TelegramId(_)) {
+                tracing::debug!(id = %event.meta.id, "stale duplicate entry id dropped");
+                continue;
+            }
+            metas.remove(pos);
+        }
+
         // dmdata/poll由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
         // 同一id再送は insert がArcを置換する。
         state.pinned.insert(event.meta.id.clone(), entry);
 
-        // 同一idのentryは置換して先頭へ
-        if let Some(pos) = metas.iter().position(|m| m.id == event.meta.id) {
-            metas.remove(pos);
-        }
         tracing::info!(id = %event.meta.id, title = %event.meta.title, "feed entry added");
-        metas.push_front(event.meta);
+        // updated降順の一覧を保つ挿入位置探索。catch-up pollの遅延publish
+        // (WSが先に新しい電文を配信済み)でも古いentryが先頭へ飛ばない。
+        // 通常のWSフロー(最新が最後に届く)では挿入位置0 = 従来のpush_front。
+        // updated は+09:00正規化済みRFC3339なので辞書順比較=時系列比較
+        let pos = metas
+            .iter()
+            .position(|m| m.updated <= event.meta.updated)
+            .unwrap_or(metas.len());
+        metas.insert(pos, event.meta);
         while metas.len() > capacity {
             if let Some(evicted) = metas.pop_back()
                 && let Some((id, entry)) = state.pinned.remove(&evicted.id)
@@ -130,28 +119,4 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         last_updated,
         last_modified,
     )));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deduper_rejects_second_insert() {
-        let deduper = Deduper::new(Duration::from_secs(60));
-        let key = DedupKey::TelegramId("t1".into());
-        assert!(deduper.check_and_insert(&key));
-        assert!(!deduper.check_and_insert(&key));
-        assert!(deduper.check_and_insert(&DedupKey::TelegramId("t2".into())));
-    }
-
-    #[test]
-    fn deduper_composite_keys_differ_by_hash() {
-        let deduper = Deduper::new(Duration::from_secs(60));
-        let a = DedupKey::composite("e1", "2026-07-05T04:10:00+09:00", b"body-a");
-        let b = DedupKey::composite("e1", "2026-07-05T04:10:00+09:00", b"body-b");
-        assert!(deduper.check_and_insert(&a));
-        assert!(deduper.check_and_insert(&b));
-        assert!(!deduper.check_and_insert(&a));
-    }
 }

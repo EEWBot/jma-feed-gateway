@@ -388,7 +388,10 @@ mod tests {
         let list = api(&server).socket_list_open().await.expect("must succeed");
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].id, 101);
-        assert_eq!(list.items[0].app_name.as_deref(), Some("jma-feed-gateway-1"));
+        assert_eq!(
+            list.items[0].app_name.as_deref(),
+            Some("jma-feed-gateway-1")
+        );
     }
 
     #[tokio::test]

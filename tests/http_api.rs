@@ -249,12 +249,7 @@ async fn data_miss_holds_and_serves_200() {
     std::mem::forget(rx);
     let router = build_router(state.clone());
 
-    let response = get(
-        &router,
-        &format!("/developer/xml/data/{MISS_ID}.xml"),
-        None,
-    )
-    .await;
+    let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         header_str(&response, "etag").is_some_and(|e| e.starts_with('"')),
@@ -355,7 +350,11 @@ async fn singleflight_hits_upstream_once() {
         c.dmdata.data_api_base = mock_server.uri();
     });
     // fetch_entity はEvent経由でaggregatorに渡すため、aggregatorを起動する
-    tokio::spawn(jma_feed_gateway::aggregator::run(Vec::new(), rx, state.clone()));
+    tokio::spawn(jma_feed_gateway::aggregator::run(
+        Vec::new(),
+        rx,
+        state.clone(),
+    ));
     for _ in 0..100 {
         if state.readiness.aggregator_running.load(Ordering::Relaxed) {
             break;
@@ -422,12 +421,7 @@ async fn data_miss_upstream_error_returns_404() {
     std::mem::forget(rx);
     let router = build_router(state.clone());
 
-    let response = get(
-        &router,
-        &format!("/developer/xml/data/{MISS_ID}.xml"),
-        None,
-    )
-    .await;
+    let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(
         response.headers().get(header::LOCATION).is_none(),
@@ -461,12 +455,7 @@ async fn data_miss_fetch_timeout_returns_404() {
     std::mem::forget(rx);
     let router = build_router(state.clone());
 
-    let response = get(
-        &router,
-        &format!("/developer/xml/data/{MISS_ID}.xml"),
-        None,
-    )
-    .await;
+    let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(
         response.headers().get(header::LOCATION).is_none(),

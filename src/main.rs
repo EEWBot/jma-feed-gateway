@@ -14,7 +14,7 @@ use jma_feed_gateway::config::Config;
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::error::{AppError, ConfigError};
 use jma_feed_gateway::state::AppState;
-use jma_feed_gateway::types::Event;
+use jma_feed_gateway::types::{DedupKey, Event};
 use jma_feed_gateway::{aggregator, dmdata, fetcher, http, poller};
 
 #[tokio::main]
@@ -69,6 +69,12 @@ async fn run() -> Result<(), AppError> {
 
     let (event_tx, event_rx) = mpsc::channel::<Event>(1024);
     let state = Arc::new(AppState::new(config.clone(), dmdata_api, event_tx.clone()));
+
+    // warmup済み電文IDをdedupへseed(spawn前に行い初回pollとの競合を排除)。
+    // WS全断起動時に初回pollがリストページを丸ごと再fetch/再publishするのを防ぐ
+    for meta in &initial_metas {
+        state.deduper.insert(DedupKey::TelegramId(meta.id.clone()));
+    }
 
     // Aggregator(唯一の書き込み点)。初期一覧を渡してスナップショット生成を任せる
     tokio::spawn(aggregator::run(initial_metas, event_rx, state.clone()));

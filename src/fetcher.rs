@@ -104,10 +104,7 @@ async fn list_page_with_retry(
 
 /// 電文種別コードがフィルタを通過するか。空リストは全通過、大小文字無視。
 pub(crate) fn type_matches(telegram_type: &str, types: &[String]) -> bool {
-    types.is_empty()
-        || types
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(telegram_type))
+    types.is_empty() || types.iter().any(|t| t.eq_ignore_ascii_case(telegram_type))
 }
 
 /// telegram.list item のスキップ判定 + ItemMeta マッピング。poller も共有する。
@@ -454,10 +451,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/telegram"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(list_body(
-                &[("ID_1", "2026-07-08T10:00:00+09:00")],
-                None,
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(list_body(&[("ID_1", "2026-07-08T10:00:00+09:00")], None)),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -536,10 +533,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/telegram"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(list_body(
-                &[("ID_1", "2026-07-08T10:00:00+09:00")],
-                None,
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(list_body(&[("ID_1", "2026-07-08T10:00:00+09:00")], None)),
+            )
             .mount(&server)
             .await;
 

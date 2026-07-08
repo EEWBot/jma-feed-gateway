@@ -207,9 +207,7 @@ pub async fn run_connection(
 
     loop {
         let session = run_session(index, &endpoint, &api, &app_name, &tx, &state).await;
-        if let Some(flag) = state.readiness.ws_connected.get(index) {
-            flag.store(false, Ordering::Relaxed);
-        }
+        state.readiness.mark_ws_disconnected(index);
         if tx.is_closed() {
             tracing::warn!(conn = index, "event channel closed; ws task exiting");
             return;
@@ -298,9 +296,8 @@ async fn run_session(
             Message::Text(text) => match handle_ws_message(text.as_str(), index) {
                 WsAction::None => {}
                 WsAction::Started => {
-                    if let Some(flag) = state.readiness.ws_connected.get(index) {
-                        flag.store(true, Ordering::Relaxed);
-                    }
+                    // start受信=購読確立。全断エピソード後ならcatch-up pollが通知される
+                    state.readiness.mark_ws_connected(index);
                 }
                 WsAction::Reply(json) => {
                     sink.send(Message::text(json))

@@ -95,8 +95,6 @@ pub struct PollConfig {
     pub offset_secs: u64,
     /// 1 tickで実体取得する最大entry数(バースト保護)。
     pub entry_fetch_limit: usize,
-    /// ReportDateTime逆順の訂正報を取りこぼさないための遡り猶予(秒)。
-    pub watermark_slack_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,7 +194,6 @@ mod tests {
             assert!(config.poll.enabled);
             assert_eq!(config.poll.offset_secs, 20);
             assert_eq!(config.poll.entry_fetch_limit, 20);
-            assert_eq!(config.poll.watermark_slack_secs, 600);
             Ok(())
         });
     }
@@ -271,7 +268,10 @@ mod tests {
     #[test]
     fn invalid_ws_endpoints_rejected() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JMA_FEED_GATEWAY__DMDATA__WS_ENDPOINTS", r#"["a", "b", "c"]"#);
+            jail.set_env(
+                "JMA_FEED_GATEWAY__DMDATA__WS_ENDPOINTS",
+                r#"["a", "b", "c"]"#,
+            );
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),
