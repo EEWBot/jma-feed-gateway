@@ -861,9 +861,12 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
     assert_eq!(lm2, lm1, "last_modified must not regress");
     // 順序挿入により古いentryは先頭に来ない → feed本文の<updated>(先頭entry)は最大値のまま
     assert_eq!(snapshot2.last_updated, "2026-07-05T04:20:00+09:00");
-    // HTTP用文字列も事前計算されている
+    // HTTP用HeaderValueも事前計算されている
     assert_eq!(
-        snapshot2.last_modified_http.as_deref(),
+        snapshot2
+            .last_modified_header
+            .as_ref()
+            .and_then(|v| v.to_str().ok()),
         Some("Sat, 04 Jul 2026 19:20:00 GMT")
     );
 }

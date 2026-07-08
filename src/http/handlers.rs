@@ -7,7 +7,6 @@ use axum::Json;
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use tokio::sync::watch;
 
@@ -15,37 +14,34 @@ use crate::fetcher;
 use crate::http::etag;
 use crate::jma::id::is_fetchable_id;
 use crate::state::SharedState;
+use crate::types::EntityEntry;
 
-const ATOM_CONTENT_TYPE: &str = "application/atom+xml; charset=utf-8";
-const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
+const ATOM_CONTENT_TYPE: HeaderValue =
+    HeaderValue::from_static("application/atom+xml; charset=utf-8");
+const XML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/xml; charset=utf-8");
 const X_INSTANCE_STARTED: &str = "x-instance-started";
 
 /// If-None-Match を評価して 200(body) か 304(bodyなし+ETag再送)を返す。
-fn serve_cached(
-    headers: &HeaderMap,
-    etag_value: &str,
-    body: Bytes,
-    content_type: &'static str,
-) -> Response {
+fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderValue) -> Response {
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        && etag::if_none_match(inm, etag_value)
+        && etag::if_none_match(inm, &entry.etag)
     {
         // RFC 9110: 304 は body 無しで ETag を再送する
         return (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, etag_value.to_owned())],
+            [(header::ETAG, entry.etag_header.clone())],
         )
             .into_response();
     }
     (
         StatusCode::OK,
         [
-            (header::ETAG, etag_value.to_owned()),
-            (header::CONTENT_TYPE, content_type.to_owned()),
+            (header::ETAG, entry.etag_header.clone()),
+            (header::CONTENT_TYPE, content_type),
         ],
-        body,
+        entry.body.clone(),
     )
         .into_response()
 }
@@ -79,15 +75,15 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         // RFC 9110: 304 は body 無しで ETag を再送する
         (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, snapshot.etag.clone())],
+            [(header::ETAG, snapshot.etag_header.clone())],
         )
             .into_response()
     } else {
         (
             StatusCode::OK,
             [
-                (header::ETAG, snapshot.etag.clone()),
-                (header::CONTENT_TYPE, ATOM_CONTENT_TYPE.to_owned()),
+                (header::ETAG, snapshot.etag_header.clone()),
+                (header::CONTENT_TYPE, ATOM_CONTENT_TYPE),
             ],
             snapshot.body.clone(),
         )
@@ -95,14 +91,10 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
     };
 
     let response_headers = response.headers_mut();
-    if let Some(lm) = &snapshot.last_modified_http
-        && let Ok(value) = lm.parse()
-    {
-        response_headers.insert(header::LAST_MODIFIED, value);
+    if let Some(lm) = &snapshot.last_modified_header {
+        response_headers.insert(header::LAST_MODIFIED, lm.clone());
     }
-    if let Ok(value) = state.started_at.parse() {
-        response_headers.insert(X_INSTANCE_STARTED, value);
-    }
+    response_headers.insert(X_INSTANCE_STARTED, state.started_at_header.clone());
     response
 }
 
@@ -123,12 +115,12 @@ pub async fn data(
     //    .await 跨ぎで持たないよう Arc clone して即drop
     let pinned = state.pinned.get(id).map(|entry| Arc::clone(entry.value()));
     if let Some(entry) = pinned {
-        return serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE);
+        return serve_cached(&headers, &entry, XML_CONTENT_TYPE);
     }
 
     // 2. entities(moka: ミス補充された実体 + feedから降格したdmdata entry)
     if let Some(entry) = state.entities.get(id).await {
-        return serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE);
+        return serve_cached(&headers, &entry, XML_CONTENT_TYPE);
     }
 
     // 3. ミス: 電文IDとしてありうる形式のみ dmdata telegram.data から取得する。
@@ -169,7 +161,7 @@ pub async fn data(
         _ => None,
     };
     match entry {
-        Some(entry) => serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE),
+        Some(entry) => serve_cached(&headers, &entry, XML_CONTENT_TYPE),
         // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
         // ならないため404を返す(旧JMA上流への307は廃止)
         None => StatusCode::NOT_FOUND.into_response(),

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use axum::http::HeaderValue;
 use dashmap::{DashMap, DashSet};
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -226,6 +227,8 @@ pub struct AppState {
     /// インスタンス起動時刻(RFC3339、構築時に1回だけ計算)。
     /// `X-Instance-Started` ヘッダとして返し、再起動検知に使う。
     pub started_at: String,
+    /// `started_at` の `HeaderValue`(事前生成。送出時は clone=参照カウントのみ)。
+    pub started_at_header: HeaderValue,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -239,6 +242,8 @@ impl AppState {
         let started_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339 formatting cannot fail");
+        let started_at_header =
+            HeaderValue::from_str(&started_at).expect("rfc3339 is always a valid header value");
         let readiness = Readiness::new(config.dmdata.ws_endpoints.len());
         let deduper = Deduper::new(Duration::from_secs(config.cache.seen_ttl_secs));
         let fetch_limiter = RateLimiter::new(
@@ -258,6 +263,7 @@ impl AppState {
             dmdata_api,
             event_tx,
             started_at,
+            started_at_header,
         }
     }
 }

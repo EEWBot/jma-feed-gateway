@@ -694,6 +694,48 @@ async fn feed_carries_last_modified_and_instance_started_on_200_and_304() {
     );
 }
 
+/// レスポンスヘッダ名の集合をソート済みVecで取り出す。
+fn header_names(response: &axum::response::Response) -> Vec<&str> {
+    let mut names: Vec<&str> = response.headers().keys().map(|k| k.as_str()).collect();
+    names.sort_unstable();
+    names
+}
+
+#[tokio::test]
+async fn feed_200_header_name_set_is_exact() {
+    let (_state, router) = setup().await;
+
+    let response = get(&router, FEED_PATH, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_names(&response),
+        [
+            "content-length",
+            "content-type",
+            "etag",
+            "last-modified",
+            "x-instance-started",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn feed_304_header_name_set_is_exact() {
+    let (_state, router) = setup().await;
+
+    let response = get(&router, FEED_PATH, None).await;
+    let etag = header_str(&response, "etag").unwrap().to_owned();
+
+    let response = get(&router, FEED_PATH, Some(&etag)).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    // content-length: 0 は空bodyに対してaxumが付与する(200/304共通の挙動)
+    assert_eq!(
+        header_names(&response),
+        ["content-length", "etag", "last-modified", "x-instance-started"]
+    );
+    assert_eq!(header_str(&response, "content-length"), Some("0"));
+}
+
 #[tokio::test]
 async fn feed_if_modified_since_equal_returns_304() {
     let (_state, router) = setup().await;

@@ -1,5 +1,6 @@
 //! モジュール間で共有するコア型。
 
+use axum::http::HeaderValue;
 use bytes::Bytes;
 
 use crate::http::etag::compute_etag;
@@ -78,13 +79,22 @@ pub struct EntityEntry {
     pub body: Bytes,
     /// 引用符込みの強ETag(例: `"abcd..."`)。事前生成。
     pub etag: String,
+    /// `etag` の `HeaderValue`(事前生成。送出時は clone=参照カウントのみ)。
+    pub etag_header: HeaderValue,
     pub meta: ItemMeta,
 }
 
 impl EntityEntry {
     pub fn new(body: Bytes, meta: ItemMeta) -> Self {
         let etag = compute_etag(&body);
-        Self { body, etag, meta }
+        let etag_header =
+            HeaderValue::from_str(&etag).expect("etag is always a valid header value");
+        Self {
+            body,
+            etag,
+            etag_header,
+            meta,
+        }
     }
 }
 
@@ -136,12 +146,14 @@ pub struct FeedSnapshot {
     pub body: Bytes,
     /// 引用符込みの強ETag。
     pub etag: String,
+    /// `etag` の `HeaderValue`(事前生成。送出時は clone=参照カウントのみ)。
+    pub etag_header: HeaderValue,
     /// フィードの updated(RFC3339文字列)。
     pub last_updated: String,
     /// `Last-Modified` 用時刻(単調化済み。aggregator::publish が計算)。
     pub last_modified: Option<time::OffsetDateTime>,
-    /// `last_modified` のIMF-fixdate文字列(事前計算)。
-    pub last_modified_http: Option<String>,
+    /// `last_modified` のIMF-fixdate `HeaderValue`(事前生成)。
+    pub last_modified_header: Option<HeaderValue>,
 }
 
 impl FeedSnapshot {
@@ -151,13 +163,19 @@ impl FeedSnapshot {
         last_modified: Option<time::OffsetDateTime>,
     ) -> Self {
         let etag = compute_etag(&body);
-        let last_modified_http = last_modified.map(format_imf_fixdate);
+        let etag_header =
+            HeaderValue::from_str(&etag).expect("etag is always a valid header value");
+        let last_modified_header = last_modified.map(|dt| {
+            HeaderValue::from_str(&format_imf_fixdate(dt))
+                .expect("imf-fixdate is always a valid header value")
+        });
         Self {
             body,
             etag,
+            etag_header,
             last_updated,
             last_modified,
-            last_modified_http,
+            last_modified_header,
         }
     }
 
