@@ -7,7 +7,7 @@ use crate::http::etag::compute_etag;
 /// Atom entry 1件分のメタデータ。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemMeta {
-    /// entry ID(DMDATA電文一意ID。まれに合成IDフォールバック。URLではなく素のID)。
+    /// entry ID(DMDATA電文一意ID。URLではなく素のID)。
     /// entry の link は feed_render が `id` から自サーバの data URL を生成する。
     pub id: String,
     /// Control/Title 相当。
@@ -37,7 +37,8 @@ pub enum EventSource {
 pub enum DedupKey {
     /// DMDATA電文一意ID。
     TelegramId(String),
-    /// DMDATA IDが無い場合の合成キー。
+    /// キャッシュミス補充(CacheFill)経路の合成キー。
+    /// 同一entry idでも本文更新を区別できるよう body_hash を含む。
     Composite {
         entry_id: String,
         updated: String,

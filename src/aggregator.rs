@@ -43,7 +43,7 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         // feed外ならentities(moka)へ。
         if event.source == EventSource::CacheFill {
             if metas.iter().any(|m| m.id == event.meta.id) {
-                // or_insert: WS composite経路で先に新しいbodyがpin済みなら上書きしない
+                // or_insert: WS/poll経路で先に新しいbodyがpin済みなら上書きしない
                 state.pinned.entry(event.meta.id.clone()).or_insert(entry);
             } else {
                 state.entities.insert(event.meta.id.clone(), entry).await;
@@ -55,8 +55,9 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         // 同一entry idの再着: TelegramIdキーなら同一電文の重複で確定
         // (dmdata電文IDは電文ごとに一意・訂正報は新ID)なのでdrop。
         // seen TTL失効後もリストページに残る古い電文の再publishによる
-        // 順序破壊を防ぐ。Compositeキー(WS空IDフォールバックの合成ID経路)
-        // のみ正当な「同一entry id・別本文」更新として置換する。
+        // 順序破壊を防ぐ。Compositeキー(CacheFill経路)のみ正当な
+        // 「同一entry id・別本文」更新として置換する。CacheFillは上の分岐で
+        // continueされ通常ここには到達しないが、防御としてこの分岐を残す。
         if let Some(pos) = metas.iter().position(|m| m.id == event.meta.id) {
             if matches!(event.dedup_key, DedupKey::TelegramId(_)) {
                 tracing::debug!(id = %event.meta.id, "stale duplicate entry id dropped");
