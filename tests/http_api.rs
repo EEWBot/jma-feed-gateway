@@ -331,7 +331,11 @@ async fn upstream_redirect_never_leaves_jma_host() {
     let (_state, router) = setup().await;
     for evil in ["//evil.com/x", "/%2F%2Fevil.com/x", "/\\evil.com"] {
         let response = get(&router, evil, None).await;
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "uri={evil}");
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "uri={evil}"
+        );
         let location = header_str(&response, "location").unwrap();
         assert!(
             location.starts_with("https://www.data.jma.go.jp/"),

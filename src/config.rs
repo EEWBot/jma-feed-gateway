@@ -278,10 +278,7 @@ mod tests {
         figment::Jail::expect_with(|_jail| {
             let config = Config::from_figment(Figment::from(Toml::string(DEFAULT_CONFIG_TOML)))
                 .expect("default config must load");
-            assert_eq!(
-                config.http.upstream_base_url,
-                "https://www.data.jma.go.jp"
-            );
+            assert_eq!(config.http.upstream_base_url, "https://www.data.jma.go.jp");
             Ok(())
         });
     }
