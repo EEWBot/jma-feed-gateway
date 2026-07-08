@@ -17,14 +17,10 @@ impl From<figment::Error> for ConfigError {
     }
 }
 
-/// 上流(JMA)へのHTTPアクセスエラー。
+/// 上流XML(JMA形式)のパースエラー。
 #[derive(Debug, Error)]
 pub enum UpstreamError {
-    #[error("upstream http request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("upstream returned unexpected status: {0}")]
-    Status(reqwest::StatusCode),
-    #[error("failed to parse upstream feed: {0}")]
+    #[error("failed to parse upstream xml: {0}")]
     Parse(String),
 }
 
@@ -47,8 +43,6 @@ pub enum DmdataError {
 pub enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
-    #[error(transparent)]
-    Upstream(#[from] UpstreamError),
     #[error(transparent)]
     Dmdata(#[from] DmdataError),
     #[error("http client error: {0}")]

@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::Config;
+use crate::dmdata::api::DmdataApi;
 use crate::types::{EntityEntry, Event, FeedSnapshot};
 
 /// キャッシュミス待機者へ完成entryを配るwatch。None=取得中、Some=完成。
@@ -87,7 +88,8 @@ pub struct AppState {
     /// InflightGuard により完了/失敗いずれでも必ずキーがremoveされる。
     pub inflight: DashMap<String, InflightRx>,
     pub readiness: Readiness,
-    pub client: reqwest::Client,
+    /// DMDATA APIクライアント(warmup / キャッシュミス補充 / WS認可で共用)。
+    pub dmdata_api: DmdataApi,
     /// aggregator への Event 送信口。fetch_entity はこれ経由で送る(single-writer 維持)。
     pub event_tx: mpsc::Sender<Event>,
     /// インスタンス起動時刻(RFC3339、構築時に1回だけ計算)。
@@ -98,11 +100,7 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(
-        config: Arc<Config>,
-        client: reqwest::Client,
-        event_tx: mpsc::Sender<Event>,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, dmdata_api: DmdataApi, event_tx: mpsc::Sender<Event>) -> Self {
         let entities = moka::future::Cache::builder()
             .max_capacity(config.cache.entity_capacity)
             .time_to_live(Duration::from_secs(config.cache.entity_ttl_secs))
@@ -118,7 +116,7 @@ impl AppState {
             pinned: DashMap::new(),
             inflight: DashMap::new(),
             readiness,
-            client,
+            dmdata_api,
             event_tx,
             started_at,
         }

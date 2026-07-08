@@ -1,10 +1,12 @@
 //! entry ID の導出・正規化。
 //!
-//! JMAフィードの実IDは `{yyyyMMddHHmmss}_{serial}_{電文種別コード}_{官署コード}` 形式
-//! (例: `20260705050045_0_VFVO53_010000`)。UUIDではない。
+//! entry IDは通常 DMDATA電文一意ID(384bitハッシュの16進文字列)。
+//! 電文IDが欠落するまれな場合のみ `{yyyyMMddHHmmss}_{serial}_{電文種別コード}_{EventID}`
+//! 形式の合成ID(`synthesize_id`)にフォールバックする。
 
 /// URL(例: `https://.../developer/xml/data/{id}.xml`)から素のIDを取り出す。
 /// 最終パスセグメントの `.xml` を除いた部分。URL形式でなければ None。
+#[cfg(test)]
 pub fn extract_id_from_url(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next()?;
     let segment = path.rsplit('/').next()?;
@@ -12,19 +14,14 @@ pub fn extract_id_from_url(url: &str) -> Option<&str> {
     if id.is_empty() { None } else { Some(id) }
 }
 
-/// 素のID `{datetime}_{serial}_{type}_{office}` から電文種別コード(第3フィールド)を取り出す。
-/// UUID等アンダースコア区切りでないIDは None。
-pub fn telegram_type(id: &str) -> Option<&str> {
-    let t = id.split('_').nth(2)?;
-    (!t.is_empty()).then_some(t)
-}
-
-/// JMA実ID形式 `{yyyyMMddHHmmss}_{...}` かどうかを判定する
-/// (先頭14バイトがASCII数字 + 15バイト目が `_` + 残りが非空)。
-/// dataハンドラでミス時に上流JMAへ307してよいかのゲートに使う。
-pub fn is_jma_id(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    bytes.len() > 15 && bytes[..14].iter().all(u8::is_ascii_digit) && bytes[14] == b'_'
+/// 電文IDとしてありうる形式か(長さ1..=128 かつ `[A-Za-z0-9_-]` のみ)。
+/// dataハンドラでミス時に dmdata telegram.data へ取得に行ってよいかのゲートに使う。
+/// DMDATA電文ID(16進ハッシュ)と合成ID(`synthesize_id`)の双方を通す。
+pub fn is_fetchable_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// DMDATA電文IDが空の場合のフォールバック。決定的な合成IDを生成する。
@@ -32,8 +29,8 @@ pub fn is_jma_id(id: &str) -> bool {
 /// 決定的なので2系統(tokyo/osaka)間でも一致する。
 ///
 /// 通常は `WsData.id`(DMDATA電文一意ID)をそのままentry IDに使うため、
-/// これが使われるのは電文IDが欠落しているまれな場合のみ。合成IDはJMA形式に
-/// マッチするため、キャッシュから外れた後の307リダイレクトは上流404になりうる。
+/// これが使われるのは電文IDが欠落しているまれな場合のみ。合成IDはdmdata上流に
+/// 存在しないため、キャッシュから外れた後のミスは補充に失敗し404になりうる。
 pub fn synthesize_id(
     control_datetime: &str,
     serial: Option<&str>,
@@ -84,38 +81,30 @@ mod tests {
     }
 
     #[test]
-    fn telegram_type_extracts_third_field() {
-        assert_eq!(
-            telegram_type("20260705050045_0_VXSE53_010000"),
-            Some("VXSE53")
-        );
-        // UUID(アンダースコア区切りでない)は None
-        assert_eq!(telegram_type("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b"), None);
-        // 第3フィールドが空の場合も None
-        assert_eq!(telegram_type("a__"), None);
+    fn is_fetchable_id_accepts_telegram_and_synthesized_ids() {
+        // DMDATA電文ID(384bitハッシュ = 96文字の16進)
+        let hash_id = "a".repeat(96);
+        assert!(is_fetchable_id(&hash_id));
+        // 合成IDフォールバック
+        assert!(is_fetchable_id("20260705050045_0_VXSE53_010000"));
+        // ハイフン・境界長も通す
+        assert!(is_fetchable_id("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b"));
+        assert!(is_fetchable_id("x"));
+        assert!(is_fetchable_id(&"0".repeat(128)));
     }
 
     #[test]
-    fn is_jma_id_accepts_real_jma_format() {
-        assert!(is_jma_id("20260705050045_0_VFVO53_010000"));
-        // 合成IDフォールバックもJMA形式にマッチする
-        assert!(is_jma_id("20260705041000_2_VXSE53_20260705040500"));
-    }
-
-    #[test]
-    fn is_jma_id_rejects_non_jma_formats() {
-        // UUID
-        assert!(!is_jma_id("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b"));
-        // dmdata電文ID風(先頭14バイトが数字でない)
-        assert!(!is_jma_id("a6bffef53b0eb56e844eda276e0c9741"));
+    fn is_fetchable_id_rejects_garbage() {
         // 空
-        assert!(!is_jma_id(""));
-        // `_` なし14桁
-        assert!(!is_jma_id("20260705050045"));
-        // 14桁 + `_` のみ(残りが空)
-        assert!(!is_jma_id("20260705050045_"));
-        // 13桁 + `_`
-        assert!(!is_jma_id("2026070505004_0_VFVO53_010000"));
+        assert!(!is_fetchable_id(""));
+        // 長すぎ(>128)
+        assert!(!is_fetchable_id(&"0".repeat(129)));
+        // `.` / `/` / 空白入り
+        assert!(!is_fetchable_id("foo.bar"));
+        assert!(!is_fetchable_id("foo/bar"));
+        assert!(!is_fetchable_id("foo bar"));
+        // 非ASCII
+        assert!(!is_fetchable_id("電文"));
     }
 
     #[test]

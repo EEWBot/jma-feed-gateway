@@ -14,21 +14,16 @@ use crate::state::SharedState;
 use crate::types::{DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta};
 
 /// 重複排除。TTL付きのseenキャッシュ。
-/// `seen` はソース固有ID(dmdata電文ID等)、`body_seen` は本文blake3ハッシュによる
-/// クロスソースdedupe(同一電文がdmdataとJMA pollingで別IDになるため)。
+/// キーはソース固有ID(dmdata電文ID等)。WS / poll / warmupの全経路が同一の
+/// dmdata電文IDを持つため、これだけでクロス経路dedupeが成立する。
 pub struct Deduper {
     seen: moka::sync::Cache<DedupKey, ()>,
-    body_seen: moka::sync::Cache<[u8; 32], ()>,
 }
 
 impl Deduper {
     pub fn new(ttl: Duration) -> Self {
         Self {
             seen: moka::sync::Cache::builder()
-                .max_capacity(65_536)
-                .time_to_live(ttl)
-                .build(),
-            body_seen: moka::sync::Cache::builder()
                 .max_capacity(65_536)
                 .time_to_live(ttl)
                 .build(),
@@ -41,17 +36,6 @@ impl Deduper {
             return false;
         }
         self.seen.insert(key.clone(), ());
-        true
-    }
-
-    /// 本文ハッシュが未見なら登録して true、既見なら false。
-    /// publish経路(dmdata / poll)のみが呼ぶ。JmaFeed(キャッシュミス補充)由来では
-    /// 呼ばないこと — 補充がpublish-dedupeを汚染し、後続の正規配信をdropしてしまう。
-    pub fn check_and_insert_body(&self, hash: &[u8; 32]) -> bool {
-        if self.body_seen.contains_key(hash) {
-            return false;
-        }
-        self.body_seen.insert(*hash, ());
         true
     }
 }
@@ -80,19 +64,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         // 実体キャッシュ更新(ETagは事前生成)
         let entry = Arc::new(EntityEntry::new(event.xml_body.clone(), event.meta.clone()));
 
-        // キャッシュミス補充(JmaFeed)由来はentities挿入のみで一覧は再生成しない
-        if event.source == EventSource::JmaFeed {
+        // キャッシュミス補充(CacheFill)由来はentities挿入のみで一覧は再生成しない
+        if event.source == EventSource::CacheFill {
             state.entities.insert(event.meta.id.clone(), entry).await;
             tracing::debug!(id = %event.meta.id, "entity cached (feed unchanged)");
-            continue;
-        }
-
-        // クロスソースdedupe: 同一電文はdmdataとJMA pollingでentry IDが異なるため
-        // 本文blake3ハッシュで突合する。JmaFeed early-return の後に置くことで
-        // キャッシュミス補充がpublish-dedupeを汚染しない。
-        let body_hash = *blake3::hash(&event.xml_body).as_bytes();
-        if !deduper.check_and_insert_body(&body_hash) {
-            tracing::debug!(id = %event.meta.id, "duplicate body dropped (cross-source)");
             continue;
         }
 
@@ -111,7 +86,8 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
                 && let Some((id, entry)) = state.pinned.remove(&evicted.id)
             {
                 // feedから外れたdmdata由来entryはmokaへ降格(TTL分の猶予付きで配信継続)。
-                // None(=JMAウォームアップ由来)は上流307でカバーされるため何もしない。
+                // None(=ウォームアップ由来で実体未取得)はミス時のCacheFill補充
+                // (dmdata telegram.data)でカバーされるため何もしない。
                 state.entities.insert(id, entry).await;
             }
         }
@@ -167,18 +143,6 @@ mod tests {
         assert!(deduper.check_and_insert(&key));
         assert!(!deduper.check_and_insert(&key));
         assert!(deduper.check_and_insert(&DedupKey::TelegramId("t2".into())));
-    }
-
-    #[test]
-    fn deduper_body_hash_rejects_second_insert() {
-        let deduper = Deduper::new(Duration::from_secs(60));
-        let a = *blake3::hash(b"body-a").as_bytes();
-        let b = *blake3::hash(b"body-b").as_bytes();
-        assert!(deduper.check_and_insert_body(&a));
-        assert!(!deduper.check_and_insert_body(&a));
-        // 別ハッシュは独立
-        assert!(deduper.check_and_insert_body(&b));
-        assert!(!deduper.check_and_insert_body(&b));
     }
 
     #[test]

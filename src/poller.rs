@@ -1,21 +1,18 @@
 //! 全WS切断中のフォールバックpolling。
 //!
-//! 毎分 `poll.offset_secs` 秒(壁時計基準)にJMA短期フィード(eqvol.xml)を
-//! `If-Modified-Since` 付きconditional GETし、新規電文をfeedへpublishする。
+//! 毎分 `poll.offset_secs` 秒(壁時計基準)に dmdata telegram.list を1ページ取得し、
+//! 新規電文を telegram.data v1 から取得してfeedへpublishする。
 //! WSが1本でも接続中のtickは何もしない(poll_active=false)。
 //!
 //! 不変条件:
-//! - `last_modified` は前回200の `Last-Modified` ヘッダ生値をそのまま保持し、
-//!   再フォーマットせずに `If-Modified-Since` へ返す(クロックスキュー免疫)。
 //! - fetch失敗・上限超過で未処理のentryは `pending` に保持し(seen未登録)、
 //!   次tickでwatermark再選別を**通さず**処理する。watermarkは新しい項目の
 //!   publishで前進するため、再選別に通すと古い持ち越し分が既配信扱いで
 //!   永久に失われる。
-//! - `last_modified` のコミットは `pending` が空になったtickのみ。未処理を
-//!   残したままコミットすると次tickが304になり再試行の機会を失う。
-//! - 上流フィードの一覧から消えたpendingは破棄する(滞留の自然な上限)。
+//! - 上流リストの一覧から消えたpendingは破棄する(滞留の自然な上限)。
 //! - WS復帰後もpendingは処理し切る(WSは切断中に発行された電文を再配信しない)。
-//! - WS復帰後にWSから届く重複電文は aggregator の本文ハッシュdedupeがdropする。
+//! - poll由来のEventは `DedupKey::TelegramId`(WSと同一ID)を使うため、
+//!   WS復帰後に届く重複電文は aggregator の `seen` dedupeがdropする。
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -23,30 +20,16 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::error::UpstreamError;
+use crate::error::DmdataError;
 use crate::fetcher;
-use crate::jma::feed_parse;
 use crate::state::{AppState, SharedState};
 use crate::types::{DedupKey, Event, EventSource, ItemMeta};
-
-/// poll_once 1回分の結果。テストからの観測用に公開する。
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollOutcome {
-    /// 304 Not Modified(フィード未更新)。
-    NotModified,
-    /// 200 を処理し、この件数をpublishした。
-    Published(usize),
-}
 
 /// pollerの状態。壁時計ループ(`run`)とは分離してテスト可能にする。
 #[doc(hidden)]
 pub struct Poller {
     state: SharedState,
-    /// 前回200の `Last-Modified` ヘッダ生値。そのまま `If-Modified-Since` に返す
-    /// (再フォーマット禁止 = クロックスキュー免疫)。
-    last_modified: Option<String>,
-    /// 処理済みJMAフィードentry ID(TTLは `cache.seen_ttl_secs` を流用)。
+    /// 処理済みdmdata電文ID(TTLは `cache.seen_ttl_secs` を流用)。
     seen_ids: moka::sync::Cache<String, ()>,
     /// 未処理の持ち越しentry(fetch失敗・entry_fetch_limit超過)。updated昇順。
     /// watermark再選別を通さずに次tickで処理する。
@@ -64,7 +47,6 @@ impl Poller {
             .build();
         Self {
             state,
-            last_modified: None,
             seen_ids,
             pending: Vec::new(),
             was_polling: false,
@@ -85,72 +67,52 @@ impl Poller {
         self.was_polling = active;
     }
 
-    /// 1 tick分のpoll。成功(200/304とも)で poll_active=true、失敗で false。
+    /// 1 tick分のpoll。成功で poll_active=true、失敗で false。
+    /// 成功時はpublish件数を返す。
     #[doc(hidden)]
-    pub async fn poll_once(&mut self) -> Result<PollOutcome, UpstreamError> {
+    pub async fn poll_once(&mut self) -> Result<usize, DmdataError> {
         let result = self.poll_inner().await;
         self.set_active(result.is_ok());
         result
     }
 
-    async fn poll_inner(&mut self) -> Result<PollOutcome, UpstreamError> {
+    async fn poll_inner(&mut self) -> Result<usize, DmdataError> {
         let config = self.state.config.clone();
 
-        // conditional GET: 前回のLast-Modified生値をそのまま返す
-        let mut request = self.state.client.get(&config.jma.feed_url);
-        if let Some(lm) = &self.last_modified {
-            request = request.header(reqwest::header::IF_MODIFIED_SINCE, lm);
-        }
-        let response = request.send().await?;
-        let status = response.status();
+        // telegram.list を1ページだけ取得する(条件付きGETは無い)。
+        // nextPooling トークンは使わない — WS復帰でpollingが止まると陳腐化する
+        // ため、ステートレスなwatermark方式で候補を選別する
+        let classification = config.dmdata.classifications.join(",");
+        let page = self
+            .state
+            .dmdata_api
+            .telegram_list(&classification, None, fetcher::LIST_PAGE_LIMIT)
+            .await?;
+        let items: Vec<ItemMeta> = page
+            .items
+            .iter()
+            .filter_map(|item| fetcher::select_item(item, &config.dmdata.types))
+            .collect();
 
-        // Last-Modifiedはここではコミットしない。未処理(pending)が残った場合、
-        // 次tickも200で全量を取り直して再試行する必要がある
-        // (先にコミットすると次tickが304になり、失敗分がフィード更新まで宙に浮く)
-        let mut latest_last_modified: Option<String> = None;
+        // 上流リストの一覧から消えたpendingは破棄(滞留の自然な上限)
+        self.pending.retain(|p| items.iter().any(|m| m.id == p.id));
+        // pending済みIDはfetch対象と確定済み — watermark再選別を通さない。
+        // watermarkは新項目のpublishで前進するため、再選別に通すと古い
+        // 持ち越し分が既配信扱いになり永久に失われる
+        let items: Vec<ItemMeta> = items
+            .into_iter()
+            .filter(|m| self.pending.iter().all(|p| p.id != m.id))
+            .collect();
 
-        let mut candidates: Vec<ItemMeta>;
-        if status == reqwest::StatusCode::NOT_MODIFIED {
-            if self.pending.is_empty() {
-                tracing::debug!("poll: feed not modified");
-                return Ok(PollOutcome::NotModified);
-            }
-            // フィード未更新でも持ち越し分は処理する
-            candidates = std::mem::take(&mut self.pending);
-        } else {
-            if !status.is_success() {
-                return Err(UpstreamError::Status(status));
-            }
-            latest_last_modified = response
-                .headers()
-                .get(reqwest::header::LAST_MODIFIED)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
+        // watermark: aggregatorが単調clamp済みのフィードLast-Modified
+        let watermark = self.state.feed.load().last_modified;
+        let slack = Duration::from_secs(config.poll.watermark_slack_secs);
+        let new_candidates = select_candidates(items, watermark, slack, &self.seen_ids);
 
-            let body = response.text().await?;
-            let items = feed_parse::parse(&body)?;
-            let items = fetcher::filter_by_types(items, &config.jma.telegram_types);
-
-            // 上流フィードの一覧から消えたpendingは破棄(滞留の自然な上限)
-            self.pending.retain(|p| items.iter().any(|m| m.id == p.id));
-            // pending済みIDはfetch対象と確定済み — watermark再選別を通さない。
-            // watermarkは新項目のpublishで前進するため、再選別に通すと古い
-            // 持ち越し分が既配信扱いになり永久に失われる
-            let items: Vec<ItemMeta> = items
-                .into_iter()
-                .filter(|m| self.pending.iter().all(|p| p.id != m.id))
-                .collect();
-
-            // watermark: aggregatorが単調clamp済みのフィードLast-Modified
-            let watermark = self.state.feed.load().last_modified;
-            let slack = Duration::from_secs(config.poll.watermark_slack_secs);
-            let new_candidates = select_candidates(items, watermark, slack, &self.seen_ids);
-
-            candidates = std::mem::take(&mut self.pending);
-            candidates.extend(new_candidates);
-            // JMAのupdatedは+09:00固定のRFC3339なので辞書順比較=時系列比較
-            candidates.sort_by(|a, b| a.updated.cmp(&b.updated));
-        }
+        let mut candidates = std::mem::take(&mut self.pending);
+        candidates.extend(new_candidates);
+        // updated は select_item で+09:00へ正規化済みのRFC3339なので辞書順比較=時系列比較
+        candidates.sort_by(|a, b| a.updated.cmp(&b.updated));
 
         // バースト保護: 最新 entry_fetch_limit 件を処理し、古い側はpendingへ戻す
         let deferred = candidates
@@ -163,38 +125,20 @@ impl Poller {
 
         let published = self.publish_candidates(candidates).await;
 
-        // 未処理(失敗・持ち越し)ゼロのtickのみLast-Modifiedをコミットする
-        // (ヘッダ無しの200では旧値を維持)
-        if self.pending.is_empty()
-            && let Some(lm) = latest_last_modified
-        {
-            self.last_modified = Some(lm);
-        }
-
         tracing::info!(
             published,
             pending = self.pending.len(),
             "poll tick completed"
         );
-        Ok(PollOutcome::Published(published))
+        Ok(published)
     }
 
     /// 候補(updated昇順)を実体fetch→publishする。fetch失敗分は `pending` へ
     /// 戻す(seen未登録)。publish件数を返す。
     async fn publish_candidates(&mut self, candidates: Vec<ItemMeta>) -> usize {
-        let config = self.state.config.clone();
         let mut published = 0usize;
         for meta in candidates {
-            let url = if meta.link.is_empty() {
-                format!(
-                    "{}/{}.xml",
-                    config.jma.data_base_url.trim_end_matches('/'),
-                    meta.id
-                )
-            } else {
-                meta.link.clone()
-            };
-            let body = match fetcher::fetch_bytes(&self.state.client, &url).await {
+            let body = match self.state.dmdata_api.telegram_get(&meta.id).await {
                 Ok(body) => body,
                 Err(e) => {
                     // seen登録せずpendingへ → 次tickでwatermark再選別を通さずリトライ
@@ -205,8 +149,9 @@ impl Poller {
             };
             let id = meta.id.clone();
             let event = Event {
-                source: EventSource::JmaPoll,
-                dedup_key: DedupKey::composite(id.clone(), meta.updated.clone(), &body),
+                source: EventSource::DmdataPoll,
+                // WSと同じdmdata電文ID — WS復帰時・poll重複時のdedupが `seen` で成立する
+                dedup_key: DedupKey::TelegramId(id.clone()),
                 xml_body: body,
                 meta,
             };
@@ -223,7 +168,7 @@ impl Poller {
 
     /// poll対象外のtick(WS復帰後)で持ち越し分のみ処理する。
     /// WSは切断中に発行された電文を再配信しないため、pendingを放置すると
-    /// その電文は次のアウトエージまで(フィード保持期間を過ぎれば永久に)失われる。
+    /// その電文は次のアウトエージまで(リスト保持期間を過ぎれば永久に)失われる。
     #[doc(hidden)]
     pub async fn drain_pending(&mut self) {
         if self.pending.is_empty() {
@@ -267,11 +212,11 @@ fn all_ws_down(state: &AppState) -> bool {
         .any(|b| b.load(Ordering::Relaxed))
 }
 
-/// フィードentryからfetch候補を選ぶ。
+/// リストentryからfetch候補を選ぶ。
 /// - seen済みIDは除外
 /// - `updated < watermark - slack` は既配信としてseen登録のうえ除外
 /// - 同秒以上・パース不能updatedは安全側で候補に残す(fail-open。
-///   重複は後段の本文ハッシュdedupeが吸収する)
+///   重複は後段のaggregator `seen`(TelegramId)dedupeが吸収する)
 /// - updated昇順で返す
 fn select_candidates(
     entries: Vec<ItemMeta>,
@@ -297,7 +242,7 @@ fn select_candidates(
             true
         })
         .collect();
-    // JMAのupdatedは+09:00固定のRFC3339なので辞書順比較=時系列比較
+    // updated は select_item で+09:00へ正規化済みのRFC3339なので辞書順比較=時系列比較
     candidates.sort_by(|a, b| a.updated.cmp(&b.updated));
     candidates
 }
@@ -434,7 +379,7 @@ mod tests {
         let entries = vec![meta("weird", "not-a-date")];
         let selected =
             select_candidates(entries, Some(watermark()), Duration::from_secs(600), &seen);
-        // fail-open: 後段の本文ハッシュdedupeが吸収する
+        // fail-open: 後段のaggregator seen(TelegramId)dedupeが吸収する
         assert_eq!(selected.len(), 1);
     }
 

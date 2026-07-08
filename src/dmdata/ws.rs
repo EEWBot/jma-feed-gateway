@@ -17,7 +17,7 @@ use crate::error::DmdataError;
 use crate::jma::entity_parse::parse_entity_meta;
 use crate::jma::id::synthesize_id;
 use crate::state::SharedState;
-use crate::types::{DedupKey, Event, EventSource, ItemMeta};
+use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
 #[derive(Debug)]
@@ -150,6 +150,8 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
     if updated.is_empty() {
         updated = head.time.clone().unwrap_or_default();
     }
+    // フォールバック(head.time)はZ表記UTCが混ざるため、select_item と同様に+09:00へ統一する
+    let updated = normalize_rfc3339_to_jst(&updated);
     let title = pick(&entity_meta.title, control.title.as_ref());
     let author = pick(
         &entity_meta.publishing_office,
@@ -167,9 +169,6 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
         updated: updated.clone(),
         author,
         content,
-        // DMDATA電文ID(および合成ID)はJMA本家に存在しないため上流URLなし。
-        // feed_render が自サーバの data URL を自動生成する
-        link: String::new(),
     };
 
     // dedupはDMDATA電文IDを優先、なければComposite
@@ -198,19 +197,7 @@ pub async fn run_connection(
     state: SharedState,
 ) {
     let cfg = &state.config.dmdata;
-    let Some(api_key) = cfg.api_key.as_ref() else {
-        tracing::warn!(
-            conn = index,
-            "dmdata api_key not set (JMA_FEED_GATEWAY__DMDATA__API_KEY); ws connection disabled"
-        );
-        return;
-    };
-    let api = DmdataApi::new(
-        state.client.clone(),
-        cfg.api_base.clone(),
-        api_key.expose(),
-        cfg.origin.clone(),
-    );
+    let api = state.dmdata_api.clone();
     let app_name = format!("{}-{}", cfg.app_name, index + 1);
 
     let initial_backoff = Duration::from_secs(cfg.reconnect.initial_secs.max(1));

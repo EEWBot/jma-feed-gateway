@@ -1,6 +1,9 @@
 //! JMA XML関連の純粋関数群。
 
 pub mod entity_parse;
+/// JMA形式Atomフィードのパース。プロダクションでは未使用
+/// (feed_render のrender→parseラウンドトリップテスト用に残す)。
+#[cfg(test)]
 pub mod feed_parse;
 pub mod feed_render;
 pub mod id;

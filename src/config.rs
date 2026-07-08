@@ -21,6 +21,11 @@ pub const ENV_PREFIX: &str = "JMA_FEED_GATEWAY__";
 pub struct Secret(String);
 
 impl Secret {
+    /// テスト等でコードから直接構築する用。
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -35,7 +40,6 @@ impl fmt::Debug for Secret {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub http: HttpConfig,
-    pub jma: JmaConfig,
     pub dmdata: DmdataConfig,
     pub poll: PollConfig,
     pub cache: CacheConfig,
@@ -50,30 +54,23 @@ pub struct HttpConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct JmaConfig {
-    /// 初期一覧のAtomフィードURL。
-    pub feed_url: String,
-    /// 長期フィード(eqvol_l.xml)のURL。ウォームアップ時のバックフィルに使う。
-    pub long_feed_url: String,
-    /// ウォームアップ時に採用する電文種別コード。空なら全通過。
-    #[serde(default)]
-    pub telegram_types: Vec<String>,
-    /// 実体XMLのベースURL(キャッシュミス時の307先)。
-    pub data_base_url: String,
-    pub fetch_timeout_secs: u64,
-    pub retry_attempts: u32,
-    pub retry_initial_backoff_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct DmdataConfig {
     /// DMDATA APIキー。環境変数 `JMA_FEED_GATEWAY__DMDATA__API_KEY` で設定する。
     pub api_key: Option<Secret>,
     pub api_base: String,
+    /// telegram.data v1 のベースURL(api_baseとホストが異なる)。
+    pub data_api_base: String,
+    /// dmdata へのHTTPリクエストのタイムアウト(秒)。
+    pub fetch_timeout_secs: u64,
+    /// telegram.list 取得のリトライ回数。
+    pub retry_attempts: u32,
+    /// リトライの初期バックオフ(ミリ秒)。以降は倍々。
+    pub retry_initial_backoff_ms: u64,
     /// WebSocketエンドポイント(最大2系統)。
     pub ws_endpoints: Vec<String>,
     pub classifications: Vec<String>,
-    /// 電文type絞り込み。空なら全type。
+    /// 電文type絞り込み。WSではDMDATAサーバ側フィルタ、warmup / fallback polling
+    /// (telegram.list)ではクライアント側フィルタとして適用する。空なら全type。
     #[serde(default)]
     pub types: Vec<String>,
     pub app_name: String,
@@ -92,7 +89,7 @@ pub struct ReconnectConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PollConfig {
-    /// 全WS切断中のフォールバックpollingを有効にするか。
+    /// 全WS切断中の dmdata telegram.list フォールバックpollingを有効にするか。
     pub enabled: bool,
     /// 毎分この秒にpollする(壁時計基準、0〜59)。
     pub offset_secs: u64,
@@ -136,19 +133,9 @@ impl Config {
                 "http.bind_addr must not be empty".into(),
             ));
         }
-        if self.jma.feed_url.is_empty() {
+        if self.dmdata.data_api_base.is_empty() {
             return Err(ConfigError::Invalid(
-                "jma.feed_url must not be empty".into(),
-            ));
-        }
-        if self.jma.long_feed_url.is_empty() {
-            return Err(ConfigError::Invalid(
-                "jma.long_feed_url must not be empty".into(),
-            ));
-        }
-        if self.jma.data_base_url.is_empty() {
-            return Err(ConfigError::Invalid(
-                "jma.data_base_url must not be empty".into(),
+                "dmdata.data_api_base must not be empty".into(),
             ));
         }
         if self.dmdata.ws_endpoints.is_empty() || self.dmdata.ws_endpoints.len() > 2 {
@@ -193,13 +180,8 @@ mod tests {
             )
             .expect("default config must load");
             assert_eq!(config.http.bind_addr, "127.0.0.1:8080");
-            assert_eq!(
-                config.jma.long_feed_url,
-                "https://www.data.jma.go.jp/developer/xml/feed/eqvol_l.xml"
-            );
-            assert_eq!(config.jma.telegram_types.len(), 15);
-            assert!(config.jma.telegram_types.iter().any(|t| t == "VXSE53"));
-            assert_eq!(config.dmdata.types, config.jma.telegram_types);
+            assert_eq!(config.dmdata.types.len(), 15);
+            assert!(config.dmdata.types.iter().any(|t| t == "VXSE53"));
             assert_eq!(config.dmdata.ws_endpoints.len(), 1);
             assert_eq!(
                 config.dmdata.ws_endpoints[0],
@@ -207,6 +189,10 @@ mod tests {
             );
             assert_eq!(config.dmdata.classifications, vec!["telegram.earthquake"]);
             assert!(config.dmdata.api_key.is_none());
+            assert_eq!(config.dmdata.data_api_base, "https://data.api.dmdata.jp/v1");
+            assert_eq!(config.dmdata.fetch_timeout_secs, 30);
+            assert_eq!(config.dmdata.retry_attempts, 5);
+            assert_eq!(config.dmdata.retry_initial_backoff_ms, 1000);
             assert!(config.poll.enabled);
             assert_eq!(config.poll.offset_secs, 20);
             assert_eq!(config.poll.entry_fetch_limit, 20);

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use jma_feed_gateway::aggregator;
 use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
+use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::state::{AppState, SharedState};
 use jma_feed_gateway::types::{DedupKey, Event, EventSource, ItemMeta};
 
@@ -21,7 +22,6 @@ fn meta(id: &str, title: &str, updated: &str) -> ItemMeta {
         updated: updated.into(),
         author: "気象庁".into(),
         content: format!("{title} の本文"),
-        link: String::new(),
     }
 }
 
@@ -44,7 +44,14 @@ async fn setup(feed_entries: usize, initial: Vec<ItemMeta>) -> (SharedState, mps
 
     let client = reqwest::Client::new();
     let (tx, rx) = mpsc::channel::<Event>(64);
-    let state = Arc::new(AppState::new(Arc::new(config), client, tx.clone()));
+    let dmdata_api = DmdataApi::new(
+        client.clone(),
+        config.dmdata.api_base.clone(),
+        config.dmdata.data_api_base.clone(),
+        "test-api-key",
+        None,
+    );
+    let state = Arc::new(AppState::new(Arc::new(config), dmdata_api, tx.clone()));
     tokio::spawn(aggregator::run(initial, rx, state.clone()));
 
     // aggregator起動(初期スナップショット生成済み)を待つ
@@ -179,7 +186,7 @@ async fn same_entry_id_is_replaced_and_moved_to_front() {
     let etag2 = state.feed.load_full().etag.clone();
 
     // id-a を更新 → 置換され先頭へ、重複entryなし
-    // (本文ハッシュdedupeがあるため、更新は実際の内容更新どおり別本文にする)
+    // (実際の内容更新どおり別本文にする)
     let mut event = dmdata_event("t-c", meta("id-a", "更新後", "2026-07-05T04:12:00+09:00"));
     event.xml_body = Bytes::from_static(b"<Report>id-a v2</Report>");
     tx.send(event).await.unwrap();
@@ -223,7 +230,7 @@ async fn feed_is_capped_at_capacity() {
 }
 
 #[tokio::test]
-async fn jma_feed_event_caches_entity_without_feed_rebuild() {
+async fn cache_fill_event_caches_entity_without_feed_rebuild() {
     let initial = vec![meta("id-initial", "初期", "2026-07-05T04:00:00+09:00")];
     let (state, tx) = setup(10, initial).await;
     let etag0 = state.feed.load_full().etag.clone();
@@ -235,7 +242,7 @@ async fn jma_feed_event_caches_entity_without_feed_rebuild() {
     );
     let body = Bytes::from_static(b"<Report>backfill</Report>");
     tx.send(Event {
-        source: EventSource::JmaFeed,
+        source: EventSource::CacheFill,
         dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), &body),
         xml_body: body,
         meta: item,
@@ -306,7 +313,7 @@ async fn trim_demotes_pinned_entry_to_entities() {
 #[tokio::test]
 async fn warmup_entries_are_never_pinned() {
     // ウォームアップ(初期一覧)のmetaは実体を持たずpinnedに載らない。
-    // trimで溢れても何も起きない(上流307でカバー)
+    // trimで溢れても何も起きない(ミス時のCacheFill補充でカバー)
     let initial = vec![
         meta(
             "20260705040000_0_VXSE53_A",
@@ -377,17 +384,18 @@ async fn same_id_resend_replaces_pin() {
     assert_eq!(&entry.body[..], b"<Report>updated</Report>");
 }
 
-fn jma_poll_event(item: ItemMeta, body: &'static [u8]) -> Event {
+fn dmdata_poll_event(item: ItemMeta, body: &'static [u8]) -> Event {
     Event {
-        source: EventSource::JmaPoll,
-        dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), body),
+        source: EventSource::DmdataPoll,
+        // pollerはWSと同じdmdata電文IDをdedupキーに使う
+        dedup_key: DedupKey::TelegramId(item.id.clone()),
         xml_body: Bytes::from_static(body),
         meta: item,
     }
 }
 
 #[tokio::test]
-async fn jma_poll_event_updates_feed_and_is_pinned() {
+async fn dmdata_poll_event_updates_feed_and_is_pinned() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
@@ -396,7 +404,7 @@ async fn jma_poll_event_updates_feed_and_is_pinned() {
         "poll由来の電文",
         "2026-07-05T04:10:00+09:00",
     );
-    tx.send(jma_poll_event(item, b"<Report>polled</Report>"))
+    tx.send(dmdata_poll_event(item, b"<Report>polled</Report>"))
         .await
         .unwrap();
 
@@ -414,33 +422,33 @@ async fn jma_poll_event_updates_feed_and_is_pinned() {
 }
 
 #[tokio::test]
-async fn dmdata_event_with_same_body_as_polled_is_dropped() {
+async fn dmdata_event_with_same_telegram_id_as_polled_is_dropped() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
-    // pollで先に配信された電文(実JMA ID)
+    // pollで先に配信された電文(dmdata電文ID)
     let polled = meta(
-        "20260705041000_0_VXSE53_010000",
+        "SHARED_TELEGRAM_ID",
         "poll先行",
         "2026-07-05T04:10:00+09:00",
     );
-    tx.send(jma_poll_event(polled, b"<Report>same body</Report>"))
+    tx.send(dmdata_poll_event(polled, b"<Report>poll body</Report>"))
         .await
         .unwrap();
     wait_for_feed_change(&state, &etag0).await;
     let etag1 = state.feed.load_full().etag.clone();
 
-    // WS復帰後に同一本文がdmdataから届く(別telegram_id・別entry ID)→ drop
-    let mut event = dmdata_event(
-        "t-ws-dup",
+    // WS復帰後に同一電文IDがdmdataから届く → 同一TelegramIdとしてdrop
+    tx.send(dmdata_event(
+        "SHARED_TELEGRAM_ID",
         meta(
-            "WS_TELEGRAM_ID",
+            "SHARED_TELEGRAM_ID",
             "WS再送(重複)",
             "2026-07-05T04:10:00+09:00",
         ),
-    );
-    event.xml_body = Bytes::from_static(b"<Report>same body</Report>");
-    tx.send(event).await.unwrap();
+    ))
+    .await
+    .unwrap();
 
     // sentinel: 後続の別イベントが処理された時点で重複イベントは処理済みのはず
     tx.send(dmdata_event(
@@ -452,26 +460,32 @@ async fn dmdata_event_with_same_body_as_polled_is_dropped() {
     let body = wait_for_feed_change(&state, &etag1).await;
     assert!(body.contains("id-sentinel"));
     assert!(
-        !body.contains("WS_TELEGRAM_ID"),
-        "same-body dmdata event must be dropped by cross-source dedupe"
+        !body.contains("WS再送(重複)"),
+        "same-telegram-id dmdata event must be dropped by seen dedupe"
     );
-    assert!(state.pinned.get("WS_TELEGRAM_ID").is_none());
+    // pinned本文もpoll由来のまま置き換わらない
+    let entry = state
+        .pinned
+        .get("SHARED_TELEGRAM_ID")
+        .map(|e| Arc::clone(e.value()))
+        .expect("polled entry must stay pinned");
+    assert_eq!(&entry.body[..], b"<Report>poll body</Report>");
 }
 
 #[tokio::test]
-async fn jma_feed_backfill_does_not_pollute_body_dedupe() {
+async fn cache_fill_backfill_does_not_pollute_publish_dedupe() {
     let (state, tx) = setup(10, Vec::new()).await;
     let etag0 = state.feed.load_full().etag.clone();
 
-    // キャッシュミス補充(JmaFeed)で本文Bが先に流れる
+    // キャッシュミス補充(CacheFill)が先に流れる(dedupキーはComposite)
     let backfill = meta(
-        "20260705041000_0_VXSE53_010000",
+        "SHARED_TELEGRAM_ID",
         "補充",
         "2026-07-05T04:10:00+09:00",
     );
     let body = Bytes::from_static(b"<Report>shared body</Report>");
     tx.send(Event {
-        source: EventSource::JmaFeed,
+        source: EventSource::CacheFill,
         dedup_key: DedupKey::composite(backfill.id.clone(), backfill.updated.clone(), &body),
         xml_body: body,
         meta: backfill,
@@ -481,28 +495,24 @@ async fn jma_feed_backfill_does_not_pollute_body_dedupe() {
 
     // 補充がentitiesへ入るまで待つ(処理完了の同期)
     for _ in 0..100 {
-        if state
-            .entities
-            .get("20260705041000_0_VXSE53_010000")
-            .await
-            .is_some()
-        {
+        if state.entities.get("SHARED_TELEGRAM_ID").await.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // 同一本文のdmdataイベントは汚染されずpublishされる
+    // 同一電文IDの正規配信(TelegramIdキー)は汚染されずpublishされる
+    // — CompositeとTelegramIdはvariantが異なり衝突しない
     let mut event = dmdata_event(
-        "t-real",
-        meta("WS_TELEGRAM_ID", "正規配信", "2026-07-05T04:10:00+09:00"),
+        "SHARED_TELEGRAM_ID",
+        meta("SHARED_TELEGRAM_ID", "正規配信", "2026-07-05T04:10:00+09:00"),
     );
     event.xml_body = Bytes::from_static(b"<Report>shared body</Report>");
     tx.send(event).await.unwrap();
 
     let feed_body = wait_for_feed_change(&state, &etag0).await;
     assert!(
-        feed_body.contains("WS_TELEGRAM_ID"),
+        feed_body.contains("正規配信"),
         "backfill must not pollute publish dedupe"
     );
 }

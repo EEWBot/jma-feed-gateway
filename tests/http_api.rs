@@ -15,6 +15,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
+use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::http::build_router;
 use jma_feed_gateway::state::{AppState, SharedState};
 use jma_feed_gateway::types::{EntityEntry, Event, FeedSnapshot, ItemMeta};
@@ -22,8 +23,7 @@ use tokio::sync::mpsc;
 
 const FEED_PATH: &str = "/developer/xml/feed/eqvol.xml";
 const UUID_A: &str = "ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b";
-const UUID_MISS: &str = "0af03cd5-25a9-3ba5-b73b-c9b7ce0f8a55";
-const JMA_MISS: &str = "20260705050045_0_VXSE99_010000";
+const MISS_ID: &str = "20260705050045_0_VXSE99_010000";
 /// setup() のフィードに設定する Last-Modified(2026-07-05T04:10:12+09:00 のUTC)。
 const FEED_LAST_MODIFIED: &str = "Sat, 04 Jul 2026 19:10:12 GMT";
 
@@ -42,7 +42,17 @@ fn make_state(
         .build()
         .unwrap();
     let (tx, rx) = mpsc::channel::<Event>(64);
-    (Arc::new(AppState::new(Arc::new(config), client, tx)), rx)
+    let dmdata_api = DmdataApi::new(
+        client.clone(),
+        config.dmdata.api_base.clone(),
+        config.dmdata.data_api_base.clone(),
+        "test-api-key",
+        None,
+    );
+    (
+        Arc::new(AppState::new(Arc::new(config), dmdata_api, tx)),
+        rx,
+    )
 }
 
 async fn setup() -> (SharedState, Router) {
@@ -198,14 +208,16 @@ async fn data_hit_returns_200_and_304() {
 }
 
 #[tokio::test]
-async fn data_non_jma_id_miss_returns_404() {
-    // 非JMA形式ID(UUID・DMDATA電文ID等)は上流に存在しないため404。
+async fn data_invalid_id_miss_returns_404_without_inflight() {
+    // 電文IDとしてありえない形式(`.` 等を含むゴミID)は即404。
     // 無駄なバックグラウンド取得(inflight)も起動しない
     let (state, router) = setup().await;
-    let uri = format!("/developer/xml/data/{UUID_MISS}.xml");
 
-    let response = get(&router, &uri, None).await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // "a%20b" はPath抽出で "a b"(空白入り)にデコードされる
+    for garbage in ["foo.bar", "..", "a%20b"] {
+        let response = get(&router, &format!("/developer/xml/data/{garbage}.xml"), None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "id={garbage}");
+    }
     assert!(
         state.inflight.is_empty(),
         "404 miss must not start background fetch"
@@ -213,14 +225,14 @@ async fn data_non_jma_id_miss_returns_404() {
 }
 
 #[tokio::test]
-async fn data_jma_id_miss_holds_and_serves_200() {
-    // 実JMAフィードのID形式のミスはレスポンスを保留し、取得完了後に200で返す
+async fn data_miss_holds_and_serves_200() {
+    // 電文ID形式のミスはレスポンスを保留し、取得完了後に200で返す
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/{JMA_MISS}.xml")))
+        .and(path(format!("/{MISS_ID}")))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw("<Report>held entity</Report>", "application/xml"),
@@ -229,8 +241,9 @@ async fn data_jma_id_miss_holds_and_serves_200() {
         .mount(&mock_server)
         .await;
 
+    // ミス補充はdmdata telegram.data(.xmlサフィックス無し)から取得する
     let (state, rx) = make_state(test_config(), |c| {
-        c.jma.data_base_url = mock_server.uri();
+        c.dmdata.data_api_base = mock_server.uri();
     });
     // 待機者はwatch経由で直接entryを受け取るため、aggregatorなしでも200になる
     std::mem::forget(rx);
@@ -238,7 +251,7 @@ async fn data_jma_id_miss_holds_and_serves_200() {
 
     let response = get(
         &router,
-        &format!("/developer/xml/data/{JMA_MISS}.xml"),
+        &format!("/developer/xml/data/{MISS_ID}.xml"),
         None,
     )
     .await;
@@ -327,7 +340,7 @@ async fn singleflight_hits_upstream_once() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/{JMA_MISS}.xml")))
+        .and(path(format!("/{MISS_ID}")))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw("<Report>fetched entity</Report>", "application/xml")
@@ -339,7 +352,7 @@ async fn singleflight_hits_upstream_once() {
         .await;
 
     let (state, rx) = make_state(test_config(), |c| {
-        c.jma.data_base_url = mock_server.uri();
+        c.dmdata.data_api_base = mock_server.uri();
     });
     // fetch_entity はEvent経由でaggregatorに渡すため、aggregatorを起動する
     tokio::spawn(jma_feed_gateway::aggregator::run(Vec::new(), rx, state.clone()));
@@ -353,7 +366,7 @@ async fn singleflight_hits_upstream_once() {
 
     // 並行32リクエスト → 全員が同じwatchで待機し、完成entryを200で受け取る。
     // 上流ヒットは先着の1回のみ
-    let uri = format!("/developer/xml/data/{JMA_MISS}.xml");
+    let uri = format!("/developer/xml/data/{MISS_ID}.xml");
     let futures: Vec<_> = (0..32).map(|_| get(&router, &uri, None)).collect();
     let mut first_etag: Option<String> = None;
     for response in futures_util::future::join_all(futures).await {
@@ -372,7 +385,7 @@ async fn singleflight_hits_upstream_once() {
     // 取得完了後の後処理(キャッシュ格納 + inflight解除)を待つ
     let mut cached = None;
     for _ in 0..100 {
-        if let Some(entry) = state.entities.get(JMA_MISS).await {
+        if let Some(entry) = state.entities.get(MISS_ID).await {
             cached = Some(entry);
             break;
         }
@@ -390,50 +403,48 @@ async fn singleflight_hits_upstream_once() {
 }
 
 #[tokio::test]
-async fn data_miss_upstream_error_falls_back_to_307() {
-    // 上流が5xxで取得失敗(Sender drop)した場合は従来どおり307へフォールバック
+async fn data_miss_upstream_error_returns_404() {
+    // 上流が5xxで取得失敗(Sender drop)した場合は404(dmdata data APIは
+    // 認証必須でリダイレクト先にならないため、旧JMA上流への307は廃止)
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/{JMA_MISS}.xml")))
+        .and(path(format!("/{MISS_ID}")))
         .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)
         .await;
 
     let (state, rx) = make_state(test_config(), |c| {
-        c.jma.data_base_url = mock_server.uri();
+        c.dmdata.data_api_base = mock_server.uri();
     });
     std::mem::forget(rx);
     let router = build_router(state.clone());
 
     let response = get(
         &router,
-        &format!("/developer/xml/data/{JMA_MISS}.xml"),
+        &format!("/developer/xml/data/{MISS_ID}.xml"),
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = response
-        .headers()
-        .get(header::LOCATION)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(location, format!("{}/{JMA_MISS}.xml", mock_server.uri()));
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response.headers().get(header::LOCATION).is_none(),
+        "404 must not carry Location"
+    );
     wait_inflight_empty(&state).await;
 }
 
 #[tokio::test]
-async fn data_miss_fetch_timeout_falls_back_to_307() {
-    // 上流応答が待機予算(fetch_timeout_secs + 1秒)を超える場合は307へフォールバック
+async fn data_miss_fetch_timeout_returns_404() {
+    // 上流応答が待機予算(fetch_timeout_secs + 1秒)を超える場合も404
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/{JMA_MISS}.xml")))
+        .and(path(format!("/{MISS_ID}")))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_raw("<Report>too late</Report>", "application/xml")
@@ -444,26 +455,23 @@ async fn data_miss_fetch_timeout_falls_back_to_307() {
         .await;
 
     let (state, rx) = make_state(test_config(), |c| {
-        c.jma.data_base_url = mock_server.uri();
-        c.jma.fetch_timeout_secs = 0;
+        c.dmdata.data_api_base = mock_server.uri();
+        c.dmdata.fetch_timeout_secs = 0;
     });
     std::mem::forget(rx);
     let router = build_router(state.clone());
 
     let response = get(
         &router,
-        &format!("/developer/xml/data/{JMA_MISS}.xml"),
+        &format!("/developer/xml/data/{MISS_ID}.xml"),
         None,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = response
-        .headers()
-        .get(header::LOCATION)
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(location, format!("{}/{JMA_MISS}.xml", mock_server.uri()));
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response.headers().get(header::LOCATION).is_none(),
+        "404 must not carry Location"
+    );
 }
 
 #[tokio::test]
