@@ -1,7 +1,6 @@
 //! JMA Atomフィード(eqvol.xml)のパース → `Vec<ItemMeta>`(純粋関数)。
 
 use quick_xml::Reader;
-use quick_xml::XmlVersion;
 use quick_xml::events::Event as XmlEvent;
 
 use crate::error::UpstreamError;
@@ -56,21 +55,6 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
                     text.clear();
                 }
             }
-            XmlEvent::Empty(e) => {
-                // entry 内の <link href="..."/>
-                if e.local_name().as_ref() == b"link"
-                    && let Some(meta) = current.as_mut()
-                {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.local_name().as_ref() == b"href" {
-                            meta.link = attr
-                                .normalized_value(XmlVersion::Implicit1_0)
-                                .map_err(|e| UpstreamError::Parse(e.to_string()))?
-                                .into_owned();
-                        }
-                    }
-                }
-            }
             XmlEvent::Text(e) => {
                 if field.is_some() {
                     text.push_str(
@@ -106,10 +90,7 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
                         Field::AuthorName => meta.author = value,
                         Field::Content => meta.content = value,
                         Field::Id => {
-                            // entry <id> はURL形式。素のIDを抽出し、linkが未取得ならURLを流用
-                            if meta.link.is_empty() {
-                                meta.link = value.clone();
-                            }
+                            // entry <id> はURL形式。素のIDを抽出する
                             meta.id = extract_id_from_url(&value).unwrap_or(&value).to_string();
                         }
                     }
@@ -140,10 +121,6 @@ mod tests {
         assert_eq!(first.updated, "2026-07-05T04:10:12+09:00");
         assert_eq!(first.author, "気象庁");
         assert_eq!(first.content, "5日04時05分ころ、地震がありました。");
-        assert_eq!(
-            first.link,
-            "https://www.data.jma.go.jp/developer/xml/data/ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b.xml"
-        );
 
         let second = &items[1];
         assert_eq!(second.id, "0af03cd5-25a9-3ba5-b73b-c9b7ce0f8a55");

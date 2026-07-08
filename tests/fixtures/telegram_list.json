@@ -1,0 +1,111 @@
+{
+  "responseId": "a29ab4a5-a3fa-4e63-8b53-b8b1a24e2e6e",
+  "responseTime": "2026-07-08T10:00:10+09:00",
+  "status": "ok",
+  "items": [
+    {
+      "serial": 3282569,
+      "id": "e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9d2e5f8c1b4a7d0e3f6c9b2d5",
+      "originalId": "b6cb1a0b-31bd-3f6f-b3e8-3fdcd3f7bafb",
+      "classification": "telegram.earthquake",
+      "head": {
+        "type": "VXSE53",
+        "author": "JPOS",
+        "time": "2026-07-08T01:00:00Z",
+        "designation": null,
+        "test": false
+      },
+      "receivedTime": "2026-07-08T10:00:05+09:00",
+      "xmlReport": {
+        "control": {
+          "title": "震源・震度情報",
+          "dateTime": "2026-07-08T01:00:00Z",
+          "status": "通常",
+          "editorialOffice": "大阪管区気象台",
+          "publishingOffice": "気象庁本庁"
+        },
+        "head": {
+          "title": "震源・震度に関する情報",
+          "reportDateTime": "2026-07-08T10:00:00+09:00",
+          "targetDateTime": "2026-07-08T09:55:00+09:00",
+          "eventId": "20260708095500",
+          "serial": "1",
+          "infoType": "発表",
+          "infoKind": "震源・震度情報",
+          "infoKindVersion": "1.0_1",
+          "headline": "8日09時55分ころ、地震がありました。"
+        }
+      },
+      "schema": {
+        "type": "earthquake-information",
+        "version": "1.0.0"
+      },
+      "format": "xml",
+      "url": "https://data.api.dmdata.jp/v1/e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9d2e5f8c1b4a7d0e3f6c9b2d5"
+    },
+    {
+      "serial": 3282568,
+      "id": "1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9d2e5f8c1b4a7d0e3f6c9b2e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f",
+      "originalId": "0d8f2a44-92cd-3a1e-8f0b-6c1de2f8ab01",
+      "classification": "telegram.earthquake",
+      "head": {
+        "type": "VXSE51",
+        "author": "JPOS",
+        "time": "2026-07-08T00:57:30Z",
+        "designation": null,
+        "test": false
+      },
+      "receivedTime": "2026-07-08T09:57:35+09:00",
+      "xmlReport": {
+        "control": {
+          "title": "震度速報",
+          "dateTime": "2026-07-08T00:57:30Z",
+          "status": "通常",
+          "editorialOffice": "気象庁本庁",
+          "publishingOffice": "気象庁本庁"
+        },
+        "head": {
+          "title": "震度速報",
+          "reportDateTime": "2026-07-08T09:57:00+09:00",
+          "targetDateTime": "2026-07-08T09:55:00+09:00",
+          "eventId": "20260708095500",
+          "serial": null,
+          "infoType": "発表",
+          "infoKind": "震度速報",
+          "infoKindVersion": "1.0_1",
+          "headline": "8日09時55分ころ、地震による強い揺れを感じました。"
+        }
+      },
+      "schema": {
+        "type": "earthquake-information",
+        "version": "1.0.0"
+      },
+      "format": "xml",
+      "url": "https://data.api.dmdata.jp/v1/1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9d2e5f8c1b4a7d0e3f6c9b2e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f"
+    },
+    {
+      "serial": 3282567,
+      "id": "9d2e5f8c1b4a7d0e3f6c9b2e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9c",
+      "originalId": "7e1c9b3a-40df-3c2b-9a4e-8f0d6b2c4e6a",
+      "classification": "telegram.earthquake",
+      "head": {
+        "type": "VXSE53",
+        "author": "JPOS",
+        "time": "2026-07-08T00:50:00Z",
+        "designation": null,
+        "test": true
+      },
+      "receivedTime": "2026-07-08T09:50:05+09:00",
+      "xmlReport": null,
+      "schema": {
+        "type": "earthquake-information",
+        "version": "1.0.0"
+      },
+      "format": "xml",
+      "url": "https://data.api.dmdata.jp/v1/9d2e5f8c1b4a7d0e3f6c9b2e8bd0f6e3ba9d5a8f2c1d4b7a0e3f6c9b2d5a8e1f4c7b0a3d6e9f2c5b8a1d4e7f0c3b6a9c"
+    }
+  ],
+  "nextToken": "NEXT_TOKEN_1",
+  "nextPooling": "eyJwb29saW5nIjoxfQ",
+  "nextPoolingInterval": 3000
+}

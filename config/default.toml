@@ -8,23 +8,16 @@ bind_addr = "127.0.0.1:8080"
 # 生成するAtomフィードの entry id / link に使う自サーバの公開URL
 public_base_url = "http://127.0.0.1:8080"
 
-[jma]
-feed_url = "https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml"
-long_feed_url = "https://www.data.jma.go.jp/developer/xml/feed/eqvol_l.xml"
-# ウォームアップ時に採用する電文種別コード。空リストで全通過。
-telegram_types = [
-    "VXSE51", "VXSE52", "VXSE53", "VXSE56", "VXSE60", "VXSE61", "VXSE62",
-    "VYSE50", "VYSE51", "VYSE52", "VYSE60",
-    "VTSE41", "VTSE51", "VTSE52",
-    "VZSE40",
-]
-data_base_url = "https://www.data.jma.go.jp/developer/xml/data"
-fetch_timeout_secs = 30
-retry_attempts = 5
-retry_initial_backoff_ms = 1000
-
 [dmdata]
 api_base = "https://api.dmdata.jp/v2"
+# telegram.data v1 のベースURL(api_baseとホストが異なる)
+data_api_base = "https://data.api.dmdata.jp/v1"
+# dmdata へのHTTPリクエストのタイムアウト(秒)
+fetch_timeout_secs = 30
+# telegram.list 取得のリトライ回数
+retry_attempts = 5
+# リトライの初期バックオフ(ミリ秒)。以降は倍々
+retry_initial_backoff_ms = 1000
 # WebSocketエンドポイント。契約で複数本張れる場合のみ tokyo/osaka の2本を列挙する。
 ws_endpoints = ["wss://ws.api.dmdata.jp/v2/websocket"]
 # 2本張れる契約の例:
@@ -33,8 +26,9 @@ ws_endpoints = ["wss://ws.api.dmdata.jp/v2/websocket"]
 #     "wss://ws-osaka.api.dmdata.jp/v2/websocket",
 # ]
 classifications = ["telegram.earthquake"]
-# DMDATAサーバー側の電文type絞り込み(これはDMDATAサーバー側フィルター)。
-# `types = []` にすると従来どおり全typeを受信する。
+# 電文type絞り込み。WSではDMDATAサーバー側フィルター、warmup / fallback polling
+# (telegram.list)ではクライアント側フィルターとして適用する。
+# `types = []` にすると全typeを通す。
 types = [
     "VXSE51", "VXSE52", "VXSE53", "VXSE56", "VXSE60", "VXSE61", "VXSE62",
     "VYSE50", "VYSE51", "VYSE52", "VYSE60",
@@ -50,14 +44,15 @@ max_secs = 60
 multiplier = 2.0
 
 [poll]
-# 全WS切断中のフォールバックpolling(JMA短期フィードのconditional GET)
+# 全WS切断中のフォールバックpolling(dmdata telegram.list を毎分1ページ取得)
 enabled = true
-# 毎分この秒にpollする(壁時計基準、0〜59)
-offset_secs = 20
-# 1 tickで実体取得する最大entry数(バースト保護)
-entry_fetch_limit = 20
-# ReportDateTime逆順の訂正報を取りこぼさないための遡り猶予(秒)
-watermark_slack_secs = 600
+# pollの周期(秒)
+interval_secs = 60
+
+[rate_limit]
+# 外部リクエスト起因の dmdata telegram.data 呼び出し上限(スライディングウィンドウ)
+max_requests = 40
+window_secs = 300
 
 [cache]
 # Atomフィードに保持する最大entry数

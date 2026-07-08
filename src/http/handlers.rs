@@ -6,14 +6,14 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use tokio::sync::watch;
 
 use crate::fetcher;
 use crate::http::etag;
-use crate::jma::id::is_jma_id;
+use crate::jma::id::is_fetchable_id;
 use crate::state::SharedState;
 
 const ATOM_CONTENT_TYPE: &str = "application/atom+xml; charset=utf-8";
@@ -126,15 +126,20 @@ pub async fn data(
         return serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE);
     }
 
-    // 2. entities(moka: JMA実体 + feedから降格したdmdata entry)
+    // 2. entities(moka: ミス補充された実体 + feedから降格したdmdata entry)
     if let Some(entry) = state.entities.get(id).await {
         return serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE);
     }
 
-    // 3. ミス: JMA実ID形式(`{yyyyMMddHHmmss}_...`)のみ上流へ307。
-    //    DMDATA電文ID等の非JMA形式は上流に存在しないため404
-    //    (無駄なinflight起動もしない)。
-    if !is_jma_id(id) {
+    // 3. ミス: 電文IDとしてありうる形式のみ dmdata telegram.data から取得する。
+    //    ゴミIDで dmdata API 呼び出しを浪費しない(inflight も起動しない)。
+    if !is_fetchable_id(id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可。
+    //    (evict済みでもキャッシュ在中ならステップ1-2で配信済み)
+    if !state.feed_ids.contains(id) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -143,6 +148,12 @@ pub async fn data(
     let mut rx = match state.inflight.entry(id.to_owned()) {
         Entry::Occupied(occupied) => occupied.get().clone(),
         Entry::Vacant(vacant) => {
+            // トークン消費は実際にアウトバウンドfetchをspawnする先着のみ。
+            // 既存inflightへの合流(Occupied)は消費しない。try_acquireは同期なので
+            // entry guard保持中でも安全(early returnでguardはdrop、inflight未挿入)。
+            if !state.fetch_limiter.try_acquire() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             let (tx, rx) = watch::channel(None);
             vacant.insert(rx.clone());
             tokio::spawn(fetcher::fetch_entity(state.clone(), id.to_owned(), tx));
@@ -151,7 +162,7 @@ pub async fn data(
     };
 
     // 待機予算 = クライアント全体タイムアウト + 余裕1秒(fetchはこれを超えられない)
-    let wait = Duration::from_secs(state.config.jma.fetch_timeout_secs + 1);
+    let wait = Duration::from_secs(state.config.dmdata.fetch_timeout_secs + 1);
     let entry = match tokio::time::timeout(wait, rx.wait_for(|v| v.is_some())).await {
         Ok(Ok(value)) => value.as_ref().cloned(),
         // タイムアウト or Sender drop(取得失敗)
@@ -159,15 +170,9 @@ pub async fn data(
     };
     match entry {
         Some(entry) => serve_cached(&headers, &entry.etag, entry.body.clone(), XML_CONTENT_TYPE),
-        None => {
-            // フォールバック: 従来どおり上流へ307(Redirect::to は303なので不可)
-            let location = format!(
-                "{}/{}.xml",
-                state.config.jma.data_base_url.trim_end_matches('/'),
-                id
-            );
-            Redirect::temporary(&location).into_response()
-        }
+        // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
+        // ならないため404を返す(旧JMA上流への307は廃止)
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

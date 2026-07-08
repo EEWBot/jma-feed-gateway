@@ -11,9 +11,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::OffsetTime;
 
 use jma_feed_gateway::config::Config;
-use jma_feed_gateway::error::AppError;
+use jma_feed_gateway::dmdata::api::DmdataApi;
+use jma_feed_gateway::error::{AppError, ConfigError};
 use jma_feed_gateway::state::AppState;
-use jma_feed_gateway::types::Event;
+use jma_feed_gateway::types::{DedupKey, Event};
 use jma_feed_gateway::{aggregator, dmdata, fetcher, http, poller};
 
 #[tokio::main]
@@ -41,16 +42,41 @@ async fn run() -> Result<(), AppError> {
     let config = Arc::new(Config::load()?);
     tracing::info!(bind_addr = %config.http.bind_addr, "configuration loaded");
 
+    // warmup / ミス補充 / WS認可の全てがdmdataに依存するため、APIキーは必須
+    let Some(api_key) = config.dmdata.api_key.as_ref() else {
+        return Err(ConfigError::Invalid(
+            "dmdata.api_key is required (set JMA_FEED_GATEWAY__DMDATA__API_KEY)".into(),
+        )
+        .into());
+    };
+
     let client = reqwest::Client::builder()
         .user_agent(concat!("jma-feed-gateway/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(config.jma.fetch_timeout_secs))
+        .timeout(Duration::from_secs(config.dmdata.fetch_timeout_secs))
         .build()?;
 
+    // DMDATA APIクライアントは1個だけ構築し、warmup / fetch_entity / WS で共用する
+    let dmdata_api = DmdataApi::new(
+        client.clone(),
+        config.dmdata.api_base.clone(),
+        config.dmdata.data_api_base.clone(),
+        api_key.expose(),
+        config.dmdata.origin.clone(),
+    );
+
     // 初期一覧取得(HTTP公開前に完了必須)
-    let initial_metas = fetcher::load_initial_feed(&client, &config).await?;
+    let initial_metas = fetcher::load_initial_feed(&dmdata_api, &config).await?;
 
     let (event_tx, event_rx) = mpsc::channel::<Event>(1024);
-    let state = Arc::new(AppState::new(config.clone(), client, event_tx.clone()));
+    let state = Arc::new(AppState::new(config.clone(), dmdata_api, event_tx.clone()));
+
+    // warmup済み電文IDをdedupへseed(spawn前に行い初回pollとの競合を排除)。
+    // WS全断起動時に初回pollがリストページを丸ごと再fetch/再publishするのを防ぐ。
+    // feed_ids(ミス時fetchのアローリスト)も同時にseedする
+    for meta in &initial_metas {
+        state.deduper.insert(DedupKey::TelegramId(meta.id.clone()));
+        state.feed_ids.insert(meta.id.clone());
+    }
 
     // Aggregator(唯一の書き込み点)。初期一覧を渡してスナップショット生成を任せる
     tokio::spawn(aggregator::run(initial_metas, event_rx, state.clone()));
@@ -59,7 +85,7 @@ async fn run() -> Result<(), AppError> {
         .initial_feed_loaded
         .store(true, Ordering::Relaxed);
 
-    // DMDATA WebSocket ×2(tokyo/osaka)。api_key未設定の場合はタスク内で無効化される
+    // DMDATA WebSocket ×2(tokyo/osaka)
     for (index, endpoint) in config.dmdata.ws_endpoints.iter().enumerate() {
         tokio::spawn(dmdata::ws::run_connection(
             index,

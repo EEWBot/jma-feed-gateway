@@ -128,7 +128,6 @@ mod tests {
             updated: "2026-07-05T04:10:12+09:00".into(),
             author: "気象庁".into(),
             content: "5日04時05分ころ、地震がありました。".into(),
-            link: "https://www.data.jma.go.jp/developer/xml/data/ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b.xml".into(),
         }
     }
 
@@ -142,7 +141,6 @@ mod tests {
                 updated: "2026-07-05T04:07:03+09:00".into(),
                 author: "気象庁".into(),
                 content: "強い揺れを感じました。".into(),
-                link: String::new(),
             },
         ];
         let xml = render(&metas, "http://127.0.0.1:8080/");
@@ -156,11 +154,10 @@ mod tests {
         assert_eq!(parsed[0].updated, metas[0].updated);
         assert_eq!(parsed[0].author, metas[0].author);
         assert_eq!(parsed[0].content, metas[0].content);
-        // entry の link は自サーバのURLを指す
-        assert_eq!(
-            parsed[0].link,
+        // entry の id / link は自サーバのURLを指す
+        assert!(xml_str.contains(
             "http://127.0.0.1:8080/developer/xml/data/ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b.xml"
-        );
+        ));
     }
 
     #[test]
