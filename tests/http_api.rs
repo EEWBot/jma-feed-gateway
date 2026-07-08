@@ -247,6 +247,8 @@ async fn data_miss_holds_and_serves_200() {
     });
     // 待機者はwatch経由で直接entryを受け取るため、aggregatorなしでも200になる
     std::mem::forget(rx);
+    // feed在中IDのみアウトバウンドfetch可(アローリスト)
+    state.feed_ids.insert(MISS_ID.into());
     let router = build_router(state.clone());
 
     let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
@@ -349,6 +351,8 @@ async fn singleflight_hits_upstream_once() {
     let (state, rx) = make_state(test_config(), |c| {
         c.dmdata.data_api_base = mock_server.uri();
     });
+    // feed在中IDのみアウトバウンドfetch可(アローリスト)
+    state.feed_ids.insert(MISS_ID.into());
     // fetch_entity はEvent経由でaggregatorに渡すため、aggregatorを起動する
     tokio::spawn(jma_feed_gateway::aggregator::run(
         Vec::new(),
@@ -419,6 +423,8 @@ async fn data_miss_upstream_error_returns_404() {
         c.dmdata.data_api_base = mock_server.uri();
     });
     std::mem::forget(rx);
+    // feed在中IDのみアウトバウンドfetch可(アローリスト)
+    state.feed_ids.insert(MISS_ID.into());
     let router = build_router(state.clone());
 
     let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
@@ -453,6 +459,8 @@ async fn data_miss_fetch_timeout_returns_404() {
         c.dmdata.fetch_timeout_secs = 0;
     });
     std::mem::forget(rx);
+    // feed在中IDのみアウトバウンドfetch可(アローリスト)
+    state.feed_ids.insert(MISS_ID.into());
     let router = build_router(state.clone());
 
     let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
@@ -461,6 +469,100 @@ async fn data_miss_fetch_timeout_returns_404() {
         response.headers().get(header::LOCATION).is_none(),
         "404 must not carry Location"
     );
+}
+
+#[tokio::test]
+async fn data_miss_outside_feed_returns_404_without_outbound() {
+    // feed外ID(整形済みでもアローリスト不在)は404、アウトバウンド呼び出しなし
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<Report>never served</Report>", "application/xml"),
+        )
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.dmdata.data_api_base = mock_server.uri();
+    });
+    std::mem::forget(rx);
+    // feed_ids は seed しない = feed外ID
+    let router = build_router(state.clone());
+
+    let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        state.inflight.is_empty(),
+        "allowlist miss must not start background fetch"
+    );
+    // MockServer drop 時に expect(0) が検証される
+}
+
+#[tokio::test]
+async fn data_miss_rate_limited_returns_503() {
+    // レートリミット超過(3件目)は503、アウトバウンドは上限の2回のみ
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("<Report>fetched</Report>", "application/xml"),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.dmdata.data_api_base = mock_server.uri();
+        c.rate_limit.max_requests = 2;
+    });
+    std::mem::forget(rx);
+
+    let ids = [
+        "20260705050001_0_VXSE53_010000",
+        "20260705050002_0_VXSE53_010000",
+        "20260705050003_0_VXSE53_010000",
+    ];
+    for id in ids {
+        state.feed_ids.insert(id.into());
+    }
+    let router = build_router(state.clone());
+
+    for id in &ids[..2] {
+        let response = get(&router, &format!("/developer/xml/data/{id}.xml"), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "id={id}");
+    }
+    let response = get(
+        &router,
+        &format!("/developer/xml/data/{}.xml", ids[2]),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !state.inflight.contains_key(ids[2]),
+        "rate-limited request must not start background fetch"
+    );
+    wait_inflight_empty(&state).await;
+    // MockServer drop 時に expect(2) が検証される
+}
+
+#[tokio::test]
+async fn data_evicted_from_feed_but_cached_returns_200() {
+    // feedからevict済み(feed_ids不在)でもentitiesキャッシュ在中なら配信される
+    let (state, router) = setup().await;
+    assert!(!state.feed_ids.contains(UUID_A), "premise: not in feed_ids");
+
+    let response = get(&router, &format!("/developer/xml/data/{UUID_A}.xml"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], b"<Report>cached entity</Report>");
 }
 
 #[tokio::test]

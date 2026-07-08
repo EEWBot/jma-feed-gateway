@@ -36,9 +36,18 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         // 実体キャッシュ更新(ETagは事前生成)
         let entry = Arc::new(EntityEntry::new(event.xml_body.clone(), event.meta.clone()));
 
-        // キャッシュミス補充(CacheFill)由来はentities挿入のみで一覧は再生成しない
+        // キャッシュミス補充(CacheFill)由来は一覧を再生成しない。
+        // fetch開始時はアローリスト通過済みだがその後evictされた可能性があるため、
+        // 権威である自前の `metas` を確認してから格納先を決める(単一writerなので
+        // TOCTOUなし): feed在中ならpinnedへ(不変条件「pinnedキー集合 ⊆ feed内ID」)、
+        // feed外ならentities(moka)へ。
         if event.source == EventSource::CacheFill {
-            state.entities.insert(event.meta.id.clone(), entry).await;
+            if metas.iter().any(|m| m.id == event.meta.id) {
+                // or_insert: WS composite経路で先に新しいbodyがpin済みなら上書きしない
+                state.pinned.entry(event.meta.id.clone()).or_insert(entry);
+            } else {
+                state.entities.insert(event.meta.id.clone(), entry).await;
+            }
             tracing::debug!(id = %event.meta.id, "entity cached (feed unchanged)");
             continue;
         }
@@ -57,8 +66,9 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         }
 
         // dmdata/poll由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。
-        // 同一id再送は insert がArcを置換する。
+        // 同一id再送は insert がArcを置換する。feed_ids(アローリスト)にも追加。
         state.pinned.insert(event.meta.id.clone(), entry);
+        state.feed_ids.insert(event.meta.id.clone());
 
         tracing::info!(id = %event.meta.id, title = %event.meta.title, "feed entry added");
         // updated降順の一覧を保つ挿入位置探索。catch-up pollの遅延publish
@@ -71,13 +81,16 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
             .unwrap_or(metas.len());
         metas.insert(pos, event.meta);
         while metas.len() > capacity {
-            if let Some(evicted) = metas.pop_back()
-                && let Some((id, entry)) = state.pinned.remove(&evicted.id)
-            {
-                // feedから外れたdmdata由来entryはmokaへ降格(TTL分の猶予付きで配信継続)。
-                // None(=ウォームアップ由来で実体未取得)はミス時のCacheFill補充
-                // (dmdata telegram.data)でカバーされるため何もしない。
-                state.entities.insert(id, entry).await;
+            if let Some(evicted) = metas.pop_back() {
+                if let Some((id, entry)) = state.pinned.remove(&evicted.id) {
+                    // feedから外れたdmdata由来entryはmokaへ降格(TTL分の猶予付きで
+                    // 配信継続)。未pin(=ウォームアップ由来で実体未取得)は何もしない。
+                    // 降格を先に行う — 並行リクエストが「entitiesにもなくアローリスト
+                    // からも消えた」瞬間を見ないように。
+                    state.entities.insert(id, entry).await;
+                }
+                // de-allowlistは降格の後(pinned有無問わず無条件で除去)
+                state.feed_ids.remove(&evicted.id);
             }
         }
 

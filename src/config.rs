@@ -42,6 +42,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub dmdata: DmdataConfig,
     pub poll: PollConfig,
+    pub rate_limit: RateLimitConfig,
     pub cache: CacheConfig,
 }
 
@@ -98,6 +99,14 @@ pub struct PollConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    /// 外部リクエスト起因の dmdata telegram.data 呼び出し上限(スライディングウィンドウ)。
+    pub max_requests: usize,
+    /// ウィンドウ幅(秒)。
+    pub window_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     pub feed_entries: usize,
     pub entity_capacity: u64,
@@ -149,6 +158,16 @@ impl Config {
                 "poll.entry_fetch_limit must be > 0".into(),
             ));
         }
+        if self.rate_limit.max_requests == 0 {
+            return Err(ConfigError::Invalid(
+                "rate_limit.max_requests must be > 0".into(),
+            ));
+        }
+        if self.rate_limit.window_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "rate_limit.window_secs must be > 0".into(),
+            ));
+        }
         if self.cache.feed_entries == 0 {
             return Err(ConfigError::Invalid(
                 "cache.feed_entries must be > 0".into(),
@@ -194,6 +213,8 @@ mod tests {
             assert!(config.poll.enabled);
             assert_eq!(config.poll.offset_secs, 20);
             assert_eq!(config.poll.entry_fetch_limit, 20);
+            assert_eq!(config.rate_limit.max_requests, 40);
+            assert_eq!(config.rate_limit.window_secs, 300);
             Ok(())
         });
     }
@@ -256,6 +277,28 @@ mod tests {
         });
         figment::Jail::expect_with(|jail| {
             jail.set_env("JMA_FEED_GATEWAY__POLL__ENTRY_FETCH_LIMIT", "0");
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_rate_limit_values_rejected() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JMA_FEED_GATEWAY__RATE_LIMIT__MAX_REQUESTS", "0");
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JMA_FEED_GATEWAY__RATE_LIMIT__WINDOW_SECS", "0");
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),

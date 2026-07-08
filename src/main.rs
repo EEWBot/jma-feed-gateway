@@ -71,9 +71,11 @@ async fn run() -> Result<(), AppError> {
     let state = Arc::new(AppState::new(config.clone(), dmdata_api, event_tx.clone()));
 
     // warmup済み電文IDをdedupへseed(spawn前に行い初回pollとの競合を排除)。
-    // WS全断起動時に初回pollがリストページを丸ごと再fetch/再publishするのを防ぐ
+    // WS全断起動時に初回pollがリストページを丸ごと再fetch/再publishするのを防ぐ。
+    // feed_ids(ミス時fetchのアローリスト)も同時にseedする
     for meta in &initial_metas {
         state.deduper.insert(DedupKey::TelegramId(meta.id.clone()));
+        state.feed_ids.insert(meta.id.clone());
     }
 
     // Aggregator(唯一の書き込み点)。初期一覧を渡してスナップショット生成を任せる

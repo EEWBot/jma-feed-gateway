@@ -1,11 +1,12 @@
 //! アプリケーション共有状態。HTTP層は読み取り専用でアクセスする。
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::config::Config;
@@ -53,6 +54,44 @@ impl Deduper {
     /// 登録のみ(起動時seed用)。
     pub fn insert(&self, key: DedupKey) {
         self.seen.insert(key, ());
+    }
+}
+
+/// スライディングウィンドウ式レートリミッタ。
+/// 外部リクエスト起因のアウトバウンドfetch(dmdata telegram.data)の保護に使う。
+pub struct RateLimiter {
+    limit: usize,
+    window: Duration,
+    timestamps: Mutex<VecDeque<Instant>>,
+}
+
+impl RateLimiter {
+    pub fn new(limit: usize, window: Duration) -> Self {
+        Self {
+            limit,
+            window,
+            timestamps: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// window超過分をpop → len < limit なら now を積んで true。
+    /// 同期ロックのため .await 跨ぎでの呼び出し禁止。
+    pub fn try_acquire(&self) -> bool {
+        let now = Instant::now();
+        let mut timestamps = self.timestamps.lock().expect("rate limiter lock poisoned");
+        while let Some(front) = timestamps.front() {
+            if now.duration_since(*front) >= self.window {
+                timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        if timestamps.len() < self.limit {
+            timestamps.push_back(now);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -171,6 +210,13 @@ pub struct AppState {
     /// 書き込みは aggregator(+起動時seed)のみ。pollerは候補の事前フィルタ
     /// として読むだけ。
     pub deduper: Deduper,
+    /// 現在のfeedメンバーシップ(warmup由来含む)。ミス時のアウトバウンドfetchの
+    /// アローリスト。mainがaggregator起動前にseedし、以降はaggregatorのみ書く。
+    /// 不変条件: キー集合 = aggregatorの `metas` のID集合。
+    pub feed_ids: DashSet<String>,
+    /// 外部リクエスト起因のアウトバウンドfetchのレートリミッタ(`[rate_limit]`)。
+    /// poller/warmupの内部fetchは対象外(entry_fetch_limitで制御済み)。
+    pub fetch_limiter: RateLimiter,
     pub readiness: Readiness,
     /// DMDATA APIクライアント(warmup / キャッシュミス補充 / WS認可で共用)。
     pub dmdata_api: DmdataApi,
@@ -194,6 +240,10 @@ impl AppState {
             .expect("rfc3339 formatting cannot fail");
         let readiness = Readiness::new(config.dmdata.ws_endpoints.len());
         let deduper = Deduper::new(Duration::from_secs(config.cache.seen_ttl_secs));
+        let fetch_limiter = RateLimiter::new(
+            config.rate_limit.max_requests,
+            Duration::from_secs(config.rate_limit.window_secs),
+        );
         Self {
             config,
             feed: ArcSwap::from_pointee(FeedSnapshot::empty()),
@@ -201,6 +251,8 @@ impl AppState {
             pinned: DashMap::new(),
             inflight: DashMap::new(),
             deduper,
+            feed_ids: DashSet::new(),
+            fetch_limiter,
             readiness,
             dmdata_api,
             event_tx,
@@ -241,6 +293,25 @@ mod tests {
         assert!(deduper.contains(&key));
         // seed済みキーは check_and_insert でも既見扱い
         assert!(!deduper.check_and_insert(&key));
+    }
+
+    #[test]
+    fn rate_limiter_allows_up_to_limit_then_rejects() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire(), "4th acquire must be rejected");
+    }
+
+    #[test]
+    fn rate_limiter_allows_again_after_window() {
+        let limiter = RateLimiter::new(1, Duration::from_millis(30));
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        std::thread::sleep(Duration::from_millis(50));
+        // window経過分がpopされ再度取得できる
+        assert!(limiter.try_acquire());
     }
 
     #[test]

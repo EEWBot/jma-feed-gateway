@@ -399,8 +399,55 @@ async fn feed_is_capped_at_capacity() {
     assert!(!body.contains("id-1"), "oldest entry must be evicted");
 }
 
+fn cache_fill_event(item: ItemMeta, body: &'static [u8]) -> Event {
+    Event {
+        source: EventSource::CacheFill,
+        dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), body),
+        xml_body: Bytes::from_static(body),
+        meta: item,
+    }
+}
+
 #[tokio::test]
-async fn cache_fill_event_caches_entity_without_feed_rebuild() {
+async fn cache_fill_for_feed_member_is_pinned_without_feed_rebuild() {
+    // feed在中IDのCacheFillはpinnedへ(不変条件「pinnedキー集合 ⊆ feed内ID」)。
+    // フィードスナップショットは不変
+    let initial = vec![meta("id-initial", "初期", "2026-07-05T04:00:00+09:00")];
+    let (state, tx) = setup(10, initial).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    let item = meta("id-initial", "補充された実体", "2026-07-05T04:00:00+09:00");
+    tx.send(cache_fill_event(item, b"<Report>backfill</Report>"))
+        .await
+        .unwrap();
+
+    // pinnedに入る(entitiesではない)
+    let mut pinned = None;
+    for _ in 0..100 {
+        if let Some(entry) = state
+            .pinned
+            .get("id-initial")
+            .map(|e| Arc::clone(e.value()))
+        {
+            pinned = Some(entry);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = pinned.expect("in-feed cache fill must be pinned");
+    assert_eq!(&entry.body[..], b"<Report>backfill</Report>");
+    assert!(state.entities.get("id-initial").await.is_none());
+
+    // フィードは再生成されない
+    let snapshot = state.feed.load_full();
+    assert_eq!(snapshot.etag, etag0);
+    let feed_body = String::from_utf8(snapshot.body.to_vec()).unwrap();
+    assert!(!feed_body.contains("補充された実体"));
+}
+
+#[tokio::test]
+async fn cache_fill_outside_feed_goes_to_entities() {
+    // feed外ID(fetch開始後にevictされた等)のCacheFillはentities(moka)へ
     let initial = vec![meta("id-initial", "初期", "2026-07-05T04:00:00+09:00")];
     let (state, tx) = setup(10, initial).await;
     let etag0 = state.feed.load_full().etag.clone();
@@ -410,15 +457,9 @@ async fn cache_fill_event_caches_entity_without_feed_rebuild() {
         "補充された実体",
         "2026-07-05T04:05:00+09:00",
     );
-    let body = Bytes::from_static(b"<Report>backfill</Report>");
-    tx.send(Event {
-        source: EventSource::CacheFill,
-        dedup_key: DedupKey::composite(item.id.clone(), item.updated.clone(), &body),
-        xml_body: body,
-        meta: item,
-    })
-    .await
-    .unwrap();
+    tx.send(cache_fill_event(item, b"<Report>backfill</Report>"))
+        .await
+        .unwrap();
 
     // entitiesには入る
     let mut cached = None;
@@ -435,6 +476,13 @@ async fn cache_fill_event_caches_entity_without_feed_rebuild() {
     }
     let entry = cached.expect("entity must be cached");
     assert_eq!(&entry.body[..], b"<Report>backfill</Report>");
+    assert!(
+        state
+            .pinned
+            .get("ca7203bd-93b1-3f3e-b3f0-b6d4be3b7a5b")
+            .is_none(),
+        "out-of-feed cache fill must not be pinned"
+    );
 
     // フィードは再生成されない
     let snapshot = state.feed.load_full();
@@ -481,9 +529,9 @@ async fn trim_demotes_pinned_entry_to_entities() {
 }
 
 #[tokio::test]
-async fn warmup_entries_are_never_pinned() {
-    // ウォームアップ(初期一覧)のmetaは実体を持たずpinnedに載らない。
-    // trimで溢れても何も起きない(ミス時のCacheFill補充でカバー)
+async fn warmup_entries_are_unpinned_until_cache_fill() {
+    // ウォームアップ(初期一覧)のmetaは実体を持たずCacheFill到着までは未pin。
+    // CacheFill後はfeed在中期間ずっとpinnedで配信される
     let initial = vec![
         meta(
             "20260705040000_0_VXSE53_A",
@@ -500,7 +548,31 @@ async fn warmup_entries_are_never_pinned() {
     assert!(state.pinned.is_empty(), "warmup metas must not be pinned");
     let etag = state.feed.load_full().etag.clone();
 
-    // dmdataイベントでwarmup-2が溢れる
+    // ミス補充(CacheFill)が届くとwarmup由来IDもpinnedへ昇格する
+    let item = meta(
+        "20260705040000_0_VXSE53_A",
+        "warmup-1",
+        "2026-07-05T04:00:00+09:00",
+    );
+    tx.send(cache_fill_event(item, b"<Report>warmup body</Report>"))
+        .await
+        .unwrap();
+    let mut pinned = None;
+    for _ in 0..100 {
+        if let Some(entry) = state
+            .pinned
+            .get("20260705040000_0_VXSE53_A")
+            .map(|e| Arc::clone(e.value()))
+        {
+            pinned = Some(entry);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = pinned.expect("warmup entry must be pinned after cache fill");
+    assert_eq!(&entry.body[..], b"<Report>warmup body</Report>");
+
+    // dmdataイベントで(未pinの)warmup-2が溢れる
     tx.send(dmdata_event(
         "t-new",
         meta("id-new", "新着", "2026-07-05T04:10:00+09:00"),
@@ -509,7 +581,7 @@ async fn warmup_entries_are_never_pinned() {
     .unwrap();
     wait_for_feed_change(&state, &etag).await;
 
-    // 溢れたウォームアップ由来IDはpinnedにもentitiesにも入らない
+    // 溢れた未pinのウォームアップ由来IDはpinnedにもentitiesにも入らない
     assert!(state.pinned.get("20260705035900_0_VXSE53_B").is_none());
     assert!(
         state
@@ -518,9 +590,41 @@ async fn warmup_entries_are_never_pinned() {
             .await
             .is_none()
     );
-    // 新着のみピン済み
-    assert_eq!(state.pinned.len(), 1);
+    // 新着 + CacheFill済みwarmup-1がピン済み
+    assert_eq!(state.pinned.len(), 2);
     assert!(state.pinned.get("id-new").is_some());
+}
+
+#[tokio::test]
+async fn feed_ids_track_event_addition_and_eviction() {
+    // 新規eventでfeed_idsへ追加、evictで除去される(アローリスト維持)
+    let (state, tx) = setup(2, Vec::new()).await;
+    let mut etag = state.feed.load_full().etag.clone();
+
+    for i in 1..=3 {
+        tx.send(dmdata_event(
+            &format!("t-{i}"),
+            meta(
+                &format!("id-{i}"),
+                &format!("entry {i}"),
+                &format!("2026-07-05T04:1{i}:00+09:00"),
+            ),
+        ))
+        .await
+        .unwrap();
+        let _ = wait_for_feed_change(&state, &etag).await;
+        etag = state.feed.load_full().etag.clone();
+    }
+
+    // 在中の2件はアローリスト在中、溢れたid-1は除去済み
+    assert!(
+        !state.feed_ids.contains("id-1"),
+        "evicted id must be removed"
+    );
+    assert!(state.feed_ids.contains("id-2"));
+    assert!(state.feed_ids.contains("id-3"));
+    // evict済みでもentitiesへ降格済み(配信は継続)
+    assert!(state.entities.get("id-1").await.is_some());
 }
 
 #[tokio::test]

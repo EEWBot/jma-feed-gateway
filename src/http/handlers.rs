@@ -137,11 +137,23 @@ pub async fn data(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可。
+    //    (evict済みでもキャッシュ在中ならステップ1-2で配信済み)
+    if !state.feed_ids.contains(id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // singleflight: 先着のみ取得を起動し、全員が同じ watch で完成entryを待つ。
     // DashMapのentry guardを .await 跨ぎで持たないよう、match式でrxをcloneして抜ける。
     let mut rx = match state.inflight.entry(id.to_owned()) {
         Entry::Occupied(occupied) => occupied.get().clone(),
         Entry::Vacant(vacant) => {
+            // トークン消費は実際にアウトバウンドfetchをspawnする先着のみ。
+            // 既存inflightへの合流(Occupied)は消費しない。try_acquireは同期なので
+            // entry guard保持中でも安全(early returnでguardはdrop、inflight未挿入)。
+            if !state.fetch_limiter.try_acquire() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             let (tx, rx) = watch::channel(None);
             vacant.insert(rx.clone());
             tokio::spawn(fetcher::fetch_entity(state.clone(), id.to_owned(), tx));
