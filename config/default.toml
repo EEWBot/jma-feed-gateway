@@ -7,6 +7,8 @@
 bind_addr = "127.0.0.1:8080"
 # 生成するAtomフィードの entry id / link に使う自サーバの公開URL
 public_base_url = "http://127.0.0.1:8080"
+# DNS捻じ曲げ運用時、未対応パスを 307 で転送する上流JMAのベースURL(末尾スラッシュ無し)
+upstream_base_url = "https://www.data.jma.go.jp"
 
 [dmdata]
 api_base = "https://api.dmdata.jp/v2"

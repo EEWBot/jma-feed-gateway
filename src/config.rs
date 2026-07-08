@@ -52,6 +52,10 @@ pub struct HttpConfig {
     pub bind_addr: String,
     /// 生成Atomフィードの entry id / link に使う自サーバの公開ベースURL。
     pub public_base_url: String,
+    /// DNS捻じ曲げ運用時、未対応パスを転送する上流JMAのベースURL(末尾スラッシュ無し)。
+    /// authority(ホスト)はこの固定値のみから構成し、リクエストからは path+query だけを
+    /// 連結することでオープンリダイレクトを防ぐ。
+    pub upstream_base_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +140,17 @@ impl Config {
         if self.http.bind_addr.is_empty() {
             return Err(ConfigError::Invalid(
                 "http.bind_addr must not be empty".into(),
+            ));
+        }
+        if self.http.upstream_base_url.is_empty() {
+            return Err(ConfigError::Invalid(
+                "http.upstream_base_url must not be empty".into(),
+            ));
+        }
+        // スキームを https に固定し、スキーム格下げ・別スキームへのオープンリダイレクトを防ぐ。
+        if !self.http.upstream_base_url.starts_with("https://") {
+            return Err(ConfigError::Invalid(
+                "http.upstream_base_url must start with https://".into(),
             ));
         }
         if self.dmdata.data_api_base.is_empty() {
@@ -254,6 +269,35 @@ mod tests {
             // Debug出力に秘密が漏れないこと
             let debug = format!("{:?}", config);
             assert!(!debug.contains("test-key-123"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn default_upstream_base_url_is_jma() {
+        figment::Jail::expect_with(|_jail| {
+            let config = Config::from_figment(Figment::from(Toml::string(DEFAULT_CONFIG_TOML)))
+                .expect("default config must load");
+            assert_eq!(
+                config.http.upstream_base_url,
+                "https://www.data.jma.go.jp"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn non_https_upstream_base_url_rejected() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env(
+                "JMA_FEED_GATEWAY__HTTP__UPSTREAM_BASE_URL",
+                "http://www.data.jma.go.jp",
+            );
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
             Ok(())
         });
     }

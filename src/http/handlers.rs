@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{OriginalUri, Path, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
@@ -174,6 +174,32 @@ pub async fn data(
         // ならないため404を返す(旧JMA上流への307は廃止)
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// フォールバック: 既存ルートに一致しなかった全パスを上流JMAへ 307 転送する。
+///
+/// DNS等で `https://www.data.jma.go.jp/` をこのサーバへ捻じ曲げた際、当サーバが扱わない
+/// リソース(他フィード・スタイルシート・画像等)へ到達できるようにするためのもの。
+///
+/// オープンリダイレクト対策: 転送先の authority(ホスト)は設定値 `upstream_base_url` の
+/// 固定定数のみから構成し、リクエストからは **path と query だけ** を連結する。
+/// path は axum が常に `/` 始まりを保証するため、たとえ `//evil.com` や絶対形式URIを
+/// 送られても結果は必ず `https://www.data.jma.go.jp/...`(JMAホスト上のパス)に固定され、
+/// 別ホストへは飛ばない。
+pub async fn upstream_redirect(
+    State(state): State<SharedState>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let base = state.config.http.upstream_base_url.trim_end_matches('/');
+    let location = match uri.query() {
+        Some(query) => format!("{base}{}?{query}", uri.path()),
+        None => format!("{base}{}", uri.path()),
+    };
+    // 制御文字混入等で HeaderValue にできない場合は転送しない
+    let Ok(value) = HeaderValue::from_str(&location) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, value)]).into_response()
 }
 
 /// GET /healthz — 常時200。

@@ -276,6 +276,71 @@ async fn data_without_xml_suffix_returns_404() {
 }
 
 #[tokio::test]
+async fn eqvol_l_serves_same_feed_as_eqvol() {
+    // 長期版パスは現行フィード(eqvol.xml)と同一のボディ・ETagを返す
+    let (_state, router) = setup().await;
+    const EQVOL_L_PATH: &str = "/developer/xml/feed/eqvol_l.xml";
+
+    let eqvol = get(&router, FEED_PATH, None).await;
+    let eqvol_etag = header_str(&eqvol, "etag").unwrap().to_owned();
+    let eqvol_body = body_bytes(eqvol).await;
+
+    let response = get(&router, EQVOL_L_PATH, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        header_str(&response, "content-type")
+            .unwrap()
+            .contains("atom+xml")
+    );
+    assert_eq!(header_str(&response, "etag"), Some(eqvol_etag.as_str()));
+    // fallback に食われず 307 のLocationが付かないこと
+    assert!(response.headers().get(header::LOCATION).is_none());
+    assert_eq!(body_bytes(response).await, eqvol_body);
+
+    // 304 ラウンドトリップも効く
+    let response = get(&router, EQVOL_L_PATH, Some(&eqvol_etag)).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn unmatched_path_redirects_to_upstream() {
+    // 未対応パスは 307 で上流JMAへ転送される
+    let (_state, router) = setup().await;
+    let response = get(&router, "/developer/xml/feed/extra.xml", None).await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        header_str(&response, "location"),
+        Some("https://www.data.jma.go.jp/developer/xml/feed/extra.xml")
+    );
+}
+
+#[tokio::test]
+async fn upstream_redirect_preserves_query() {
+    let (_state, router) = setup().await;
+    let response = get(&router, "/foo?a=1&b=2", None).await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        header_str(&response, "location"),
+        Some("https://www.data.jma.go.jp/foo?a=1&b=2")
+    );
+}
+
+#[tokio::test]
+async fn upstream_redirect_never_leaves_jma_host() {
+    // オープンリダイレクト不成立: どんな細工パスでも Location は必ずJMAホスト始まり
+    let (_state, router) = setup().await;
+    for evil in ["//evil.com/x", "/%2F%2Fevil.com/x", "/\\evil.com"] {
+        let response = get(&router, evil, None).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "uri={evil}");
+        let location = header_str(&response, "location").unwrap();
+        assert!(
+            location.starts_with("https://www.data.jma.go.jp/"),
+            "uri={evil} leaked to {location}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn healthz_is_always_ok() {
     let (_state, router) = setup().await;
     let response = get(&router, "/healthz", None).await;
