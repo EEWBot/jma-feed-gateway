@@ -46,8 +46,8 @@ multiplier = 2.0
 [poll]
 # 全WS切断中のフォールバックpolling(dmdata telegram.list を毎分1ページ取得)
 enabled = true
-# 毎分この秒にpollする(壁時計基準、0〜59)
-offset_secs = 20
+# pollの周期(秒)
+interval_secs = 60
 
 [rate_limit]
 # 外部リクエスト起因の dmdata telegram.data 呼び出し上限(スライディングウィンドウ)

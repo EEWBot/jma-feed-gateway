@@ -1,6 +1,6 @@
 //! 全WS切断中のフォールバックpollingと、WS復帰時のcatch-up poll。
 //!
-//! 毎分 `poll.offset_secs` 秒(壁時計基準)に dmdata telegram.list を1ページ取得し、
+//! `poll.interval_secs` 秒ごとに dmdata telegram.list を1ページ取得し、
 //! 新規電文をmeta-onlyのEventとしてfeedへpublishする(実体はここでは取得しない)。
 //! 実体は初回HTTPアクセス時にCacheFill経路(singleflight + `[rate_limit]`)で
 //! 遅延取得される。
@@ -15,7 +15,7 @@
 //!   フィードの正しさ・重複には影響しない(正しさはaggregatorの
 //!   `check_and_insert` が唯一の判定点として保証する)。
 //! - backlogフラグ契約: list取得に失敗したtickだけ `backlog = true`。
-//!   backlogがある限りWS接続中でも毎分tickでpollを続ける
+//!   backlogがある限りWS接続中でもtickごとにpollを続ける
 //!   (WSは切断中に発行された電文を再配信しないため、pollで捌き切る)。
 //!   成功したtickで自動クリアされる。
 //! - WS接続中のpoll(backlog消化・catch-up)では `poll_active` を更新しない
@@ -25,8 +25,6 @@
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-use time::OffsetDateTime;
 
 use crate::error::DmdataError;
 use crate::fetcher;
@@ -75,7 +73,7 @@ impl Poller {
     }
 
     /// 1 tick分のpoll。`fallback`(全WS切断中)のときだけ poll_active を
-    /// 成否で更新する。list取得失敗は backlog=true にして毎分tickの
+    /// 成否で更新する。list取得失敗は backlog=true にして次tickの
     /// リトライへ委ねる(catch-upの取り逃しゼロ保証が単発通知に依存しない)。
     /// 成功時はpublish件数を返す。
     #[doc(hidden)]
@@ -146,36 +144,22 @@ impl Poller {
     }
 }
 
-/// 次のpoll時刻(毎分 `offset_secs` 秒)までの待ち時間。戻り値は (0, 60s]。
-/// ちょうど offset 秒なら次分まで待つ(純関数)。
-fn duration_until_next_tick(now: OffsetDateTime, offset_secs: u64) -> Duration {
-    const MINUTE_NANOS: u64 = 60_000_000_000;
-    let in_minute = u64::from(now.second()) * 1_000_000_000 + u64::from(now.nanosecond());
-    let target = offset_secs * 1_000_000_000;
-    let mut wait = (target + MINUTE_NANOS - in_minute) % MINUTE_NANOS;
-    if wait == 0 {
-        wait = MINUTE_NANOS;
-    }
-    Duration::from_nanos(wait)
-}
-
 /// pollerタスク本体。mainからspawnする。
-/// 毎周回、壁時計から次tickまでの待ち時間を再計算する(ドリフト自己補正)。
-/// `ws_recovered` 通知でのwakeは全断エピソードからの復帰を意味し、
-/// tick時刻を待たずにcatch-up pollを走らせる(コールドスタートの初回接続は
-/// エピソード無しのため通知されない)。
+/// `interval_secs` 秒周期でpollし、`ws_recovered` 通知でのwakeは全断エピソードからの
+/// 復帰を意味し、tick時刻を待たずにcatch-up pollを走らせる(コールドスタートの初回
+/// 接続はエピソード無しのため通知されない)。
 pub async fn run(state: SharedState) {
     let poll_config = &state.config.poll;
     if !poll_config.enabled {
         tracing::info!("poll fallback disabled by config");
         return;
     }
-    let offset_secs = poll_config.offset_secs;
-    tracing::info!(offset_secs, "poll fallback task started");
+    let interval_secs = poll_config.interval_secs;
+    tracing::info!(interval_secs, "poll fallback task started");
 
     let mut poller = Poller::new(state.clone());
     loop {
-        let wait = duration_until_next_tick(OffsetDateTime::now_utc(), offset_secs);
+        let wait = Duration::from_secs(interval_secs);
         let mut catch_up = false;
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
@@ -201,53 +185,8 @@ pub async fn run(state: SharedState) {
         }
 
         if let Err(e) = poller.poll_once(fallback).await {
-            // intra-minuteリトライはしない(backlog経由で次tickが再試行する)
+            // tick内リトライはしない(backlog経由で次tickが再試行する)
             tracing::warn!(error = %e, "poll failed; retrying next tick");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn at(hms: (u8, u8, u8), nanos: u32) -> OffsetDateTime {
-        time::macros::datetime!(2026-07-06 00:00:00 UTC)
-            .replace_time(time::Time::from_hms_nano(hms.0, hms.1, hms.2, nanos).unwrap())
-    }
-
-    #[test]
-    fn next_tick_before_offset_waits_until_offset() {
-        // :05.5 → 14.5s
-        let wait = duration_until_next_tick(at((12, 34, 5), 500_000_000), 20);
-        assert_eq!(wait, Duration::from_millis(14_500));
-    }
-
-    #[test]
-    fn next_tick_after_offset_waits_for_next_minute() {
-        // :45 → 35s
-        let wait = duration_until_next_tick(at((12, 34, 45), 0), 20);
-        assert_eq!(wait, Duration::from_secs(35));
-    }
-
-    #[test]
-    fn next_tick_exactly_at_offset_waits_full_minute() {
-        let wait = duration_until_next_tick(at((12, 34, 20), 0), 20);
-        assert_eq!(wait, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn next_tick_offset_zero() {
-        let wait = duration_until_next_tick(at((12, 34, 0), 0), 0);
-        assert_eq!(wait, Duration::from_secs(60));
-        let wait = duration_until_next_tick(at((12, 34, 59), 0), 0);
-        assert_eq!(wait, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn next_tick_accounts_for_nanoseconds() {
-        // :19.999999999 → 1ns
-        let wait = duration_until_next_tick(at((12, 34, 19), 999_999_999), 20);
-        assert_eq!(wait, Duration::from_nanos(1));
     }
 }
