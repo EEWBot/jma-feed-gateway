@@ -710,6 +710,7 @@ async fn feed_200_header_name_set_is_exact() {
     assert_eq!(
         header_names(&response),
         [
+            "cache-control",
             "content-length",
             "content-type",
             "etag",
@@ -731,7 +732,13 @@ async fn feed_304_header_name_set_is_exact() {
     // content-length: 0 は空bodyに対してaxumが付与する(200/304共通の挙動)
     assert_eq!(
         header_names(&response),
-        ["content-length", "etag", "last-modified", "x-instance-started"]
+        [
+            "cache-control",
+            "content-length",
+            "etag",
+            "last-modified",
+            "x-instance-started",
+        ]
     );
     assert_eq!(header_str(&response, "content-length"), Some("0"));
 }

@@ -21,6 +21,19 @@ const ATOM_CONTENT_TYPE: HeaderValue =
 const XML_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/xml; charset=utf-8");
 const X_INSTANCE_STARTED: &str = "x-instance-started";
 
+// 電文実体(telegram id 単位)は一度発行されたら内容不変(電文IDは一意)なので長期キャッシュ可
+const DATA_CACHE_CONTROL: HeaderValue =
+    HeaderValue::from_static("public, max-age=31536000, immutable");
+// フィードは地震速報等の即時性が要るため、キャッシュ本体は保持させつつも
+// 毎回オリジンへ再検証(If-None-Match)を強制する(no-cache: 「保存はして良いが
+// 使う前に必ず再検証」の意味。ETag一致なら304で本文転送は省ける)。
+// no-cacheのみで仕様上は毎回revalidation必須になるためmust-revalidateは本来冗長だが、
+// no-cacheの解釈が緩い中間キャッシュ実装への防御として併記しておく。
+const FEED_CACHE_CONTROL: HeaderValue =
+    HeaderValue::from_static("public, no-cache, must-revalidate");
+// エラー応答・ヘルスチェックはCDN/ブラウザにキャッシュさせない
+const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
+
 /// If-None-Match を評価して 200(body) か 304(bodyなし+ETag再送)を返す。
 fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderValue) -> Response {
     if let Some(inm) = headers
@@ -31,7 +44,10 @@ fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderVa
         // RFC 9110: 304 は body 無しで ETag を再送する
         return (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, entry.etag_header.clone())],
+            [
+                (header::ETAG, entry.etag_header.clone()),
+                (header::CACHE_CONTROL, DATA_CACHE_CONTROL),
+            ],
         )
             .into_response();
     }
@@ -40,6 +56,7 @@ fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderVa
         [
             (header::ETAG, entry.etag_header.clone()),
             (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, DATA_CACHE_CONTROL),
         ],
         entry.body.clone(),
     )
@@ -75,7 +92,10 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         // RFC 9110: 304 は body 無しで ETag を再送する
         (
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, snapshot.etag_header.clone())],
+            [
+                (header::ETAG, snapshot.etag_header.clone()),
+                (header::CACHE_CONTROL, FEED_CACHE_CONTROL),
+            ],
         )
             .into_response()
     } else {
@@ -84,6 +104,7 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
             [
                 (header::ETAG, snapshot.etag_header.clone()),
                 (header::CONTENT_TYPE, ATOM_CONTENT_TYPE),
+                (header::CACHE_CONTROL, FEED_CACHE_CONTROL),
             ],
             snapshot.body.clone(),
         )
@@ -105,10 +126,10 @@ pub async fn data(
     headers: HeaderMap,
 ) -> Response {
     let Some(id) = file.strip_suffix(".xml") else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     };
     if id.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
 
     // 1. pinned(feed在中のdmdata由来entry)。DashMapのRef guardを
@@ -126,13 +147,13 @@ pub async fn data(
     // 3. ミス: 電文IDとしてありうる形式のみ dmdata telegram.data から取得する。
     //    ゴミIDで dmdata API 呼び出しを浪費しない(inflight も起動しない)。
     if !is_fetchable_id(id) {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
 
     // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可。
     //    (evict済みでもキャッシュ在中ならステップ1-2で配信済み)
     if !state.feed_ids.contains(id) {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
 
     // singleflight: 先着のみ取得を起動し、全員が同じ watch で完成entryを待つ。
@@ -144,7 +165,11 @@ pub async fn data(
             // 既存inflightへの合流(Occupied)は消費しない。try_acquireは同期なので
             // entry guard保持中でも安全(early returnでguardはdrop、inflight未挿入)。
             if !state.fetch_limiter.try_acquire() {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CACHE_CONTROL, NO_STORE)],
+                )
+                    .into_response();
             }
             let (tx, rx) = watch::channel(None);
             vacant.insert(rx.clone());
@@ -164,7 +189,7 @@ pub async fn data(
         Some(entry) => serve_cached(&headers, &entry, XML_CONTENT_TYPE),
         // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
         // ならないため404を返す(旧JMA上流への307は廃止)
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response(),
     }
 }
 
@@ -189,14 +214,21 @@ pub async fn upstream_redirect(
     };
     // 制御文字混入等で HeaderValue にできない場合は転送しない
     let Ok(value) = HeaderValue::from_str(&location) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     };
-    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, value)]).into_response()
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [
+            (header::LOCATION, value),
+            (header::CACHE_CONTROL, NO_STORE),
+        ],
+    )
+        .into_response()
 }
 
 /// GET /healthz — 常時200。
-pub async fn healthz() -> &'static str {
-    "ok"
+pub async fn healthz() -> Response {
+    (StatusCode::OK, [(header::CACHE_CONTROL, NO_STORE)], "ok").into_response()
 }
 
 /// GET /readyz — ready なら200、でなければ503+状態JSON。
@@ -207,5 +239,5 @@ pub async fn readyz(State(state): State<SharedState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(snapshot)).into_response()
+    (status, [(header::CACHE_CONTROL, NO_STORE)], Json(snapshot)).into_response()
 }
