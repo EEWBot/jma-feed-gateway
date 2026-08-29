@@ -563,6 +563,9 @@ async fn run_session(
             () = sleep_until_opt(deadline) => {
                 return Err(on_watchdog_timeout(api, index, socket_id, pong_timeout));
             }
+            () = local_tx.closed() => {
+                return Err(DmdataError::Ws("event forwarder stopped".into()));
+            }
         }
     }
 
