@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use crate::error::DmdataError;
 use crate::fetcher;
-use crate::state::SharedState;
+use crate::state::{PollActiveGuard, SharedState};
 use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta};
 
@@ -158,6 +158,7 @@ pub async fn run(state: SharedState) -> TaskExit {
     let interval_secs = poll_config.interval_secs;
     tracing::info!(interval_secs, "poll fallback task started");
 
+    let _poll_guard = PollActiveGuard::new(state.clone());
     let mut poller = Poller::new(state.clone());
     loop {
         let wait = Duration::from_secs(interval_secs);

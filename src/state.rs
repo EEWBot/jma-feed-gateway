@@ -190,6 +190,56 @@ pub struct ReadinessSnapshot {
     pub poll: bool,
 }
 
+/// WS接続タスクの生存期間に `ws_connected[index]` を束ねる Drop ガード。
+///
+/// supervisor は panic したタスクをバックオフ(最大60秒)後に再起動するため、
+/// 「再起動したタスクが自分で後始末する」契約だとその間 `ws_connected` が
+/// true のまま残り、readiness が固着する。ガードにすることで panic unwind でも
+/// future の drop(cancel)でも即座にフラグが落ちる。
+///
+/// `mark_ws_disconnected` 経由なのは意図的 — 全断になったら `fully_down` を立て、
+/// 復帰時の catch-up poll を確実に走らせる(panic 中の電文は取り逃している)。
+pub struct WsConnectionGuard {
+    state: SharedState,
+    index: usize,
+}
+
+impl WsConnectionGuard {
+    pub fn new(state: SharedState, index: usize) -> Self {
+        Self { state, index }
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        self.state.readiness.mark_ws_disconnected(self.index);
+    }
+}
+
+/// pollerタスクの生存期間に `poll_active` を束ねる Drop ガード。
+///
+/// poller には WS 側の入口クリアに相当する処理が無いため、panic すると
+/// バックオフに加えて再起動後の最初のtickまで stale-true が残る。
+/// ガードは panic unwind の時点でこれを閉じる。
+pub struct PollActiveGuard {
+    state: SharedState,
+}
+
+impl PollActiveGuard {
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for PollActiveGuard {
+    fn drop(&mut self) {
+        self.state
+            .readiness
+            .poll_active
+            .store(false, Ordering::Relaxed);
+    }
+}
+
 pub struct AppState {
     pub config: Arc<Config>,
     /// 完成済みAtomフィード。更新は aggregator のみ。

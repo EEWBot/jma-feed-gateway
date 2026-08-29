@@ -9,9 +9,10 @@
 //!
 //! 不変条件:
 //! - `TaskExit::Done` を返したタスクは再起動しない(意図した終了)。
-//! - panic からの再起動では、タスク側が「異常終了した自分」の後始末を
-//!   自前で行う責務を負う(例: `run_connection` はループ前に
-//!   `mark_ws_disconnected` を呼び、readiness の固着を防ぐ)。
+//! - readiness フラグは接続/稼働の lifetime に束ねた Drop ガード
+//!   (`WsConnectionGuard` / `PollActiveGuard`)が落とす。panic unwind でも
+//!   future の drop でもその場でクリアされるため、ここのバックオフ
+//!   (最大60秒)の間 readiness が固着することはない。
 
 use std::future::Future;
 use std::sync::Arc;

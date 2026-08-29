@@ -15,7 +15,7 @@ use crate::dmdata::body::decode_body;
 use crate::dmdata::protocol::{WsClientPing, WsClientPong, WsData, WsMessage};
 use crate::error::DmdataError;
 use crate::jma::entity_parse::parse_entity_meta;
-use crate::state::SharedState;
+use crate::state::{SharedState, WsConnectionGuard};
 use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
@@ -234,6 +234,7 @@ pub async fn run_connection(
     state: SharedState,
 ) -> TaskExit {
     state.readiness.mark_ws_disconnected(index);
+    let _ws_guard = WsConnectionGuard::new(state.clone(), index);
 
     let cfg = &state.config.dmdata;
     let api = state.dmdata_api.clone();
