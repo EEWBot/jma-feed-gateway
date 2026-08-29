@@ -39,6 +39,8 @@ types = [
 ]
 app_name = "jma-feed-gateway"
 cleanup_stale_sockets = true
+ws_ping_interval_secs = 30
+ws_pong_timeout_secs = 60
 
 [dmdata.reconnect]
 initial_secs = 1

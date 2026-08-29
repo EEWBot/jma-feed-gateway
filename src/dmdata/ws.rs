@@ -1,12 +1,38 @@
 //! DMDATA WebSocket接続タスク。
 //! 受信→body展開→`Event`構築→mpsc送信のみを行い、キャッシュには触れない。
 //! 参照: docs/gateway/DmdataGateway.java
+//!
+//! # タスク構成
+//!
+//! 接続1本につき2タスクに分ける。WebSocketのcontrol plane(read / JSON ping応答 /
+//! watchdog ping-pong)を、aggregatorへのbackpressureから構造的に切り離すため。
+//!
+//! ```text
+//! protocol task (run_session)
+//!  ├─ stream read / JSON ping応答 / watchdog ping-pong
+//!  └─ Event → ローカル境界付きキュー(LOCAL_QUEUE_CAPACITY)
+//!
+//! forwarder task (接続ごと、run_connection が spawn)
+//!  └─ ローカルキュー → aggregator の event_tx
+//! ```
+//!
+//! 不変条件:
+//! - protocol task は `local_tx` にしか送らない。`event_tx` を直接触らない。
+//! - `forward_events` が `event_tx` への唯一の無制限 `.await` 点。
+//! - ローカルキュー満杯 = aggregator 停滞。stream の読み取りを止めて取りこぼしを
+//!   防ぐ(try_sendは使わない)が、`reserve()` を ping/watchdog と同じ `select!` に
+//!   置くため control plane は生き続ける。pong を読めないので `PONG_TIMEOUT` で
+//!   watchdog が発火し、セッションを落として `ws_connected=false` にする。
+//!   「静かに詰まったまま接続中を主張する」より「切れて poll fallback に渡す」を選ぶ。
+//! - sink への write は `WRITE_TIMEOUT` 付き。network write が固まったまま
+//!   watchdog へ戻れなくなるのを防ぐ。
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -20,9 +46,9 @@ use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const PING_INTERVAL: Duration = Duration::from_secs(30);
-const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_QUEUE_CAPACITY: usize = 256;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PendingPing {
     id: String,
@@ -33,14 +59,16 @@ struct PingWatchdog {
     conn: usize,
     seq: u64,
     pending: Option<PendingPing>,
+    pong_timeout: Duration,
 }
 
 impl PingWatchdog {
-    fn new(conn: usize) -> Self {
+    fn with_timeout(conn: usize, pong_timeout: Duration) -> Self {
         Self {
             conn,
             seq: 0,
             pending: None,
+            pong_timeout,
         }
     }
 
@@ -71,7 +99,7 @@ impl PingWatchdog {
     fn deadline(&self) -> Option<tokio::time::Instant> {
         self.pending
             .as_ref()
-            .map(|pending| pending.sent_at + PONG_TIMEOUT)
+            .map(|pending| pending.sent_at + self.pong_timeout)
     }
 }
 
@@ -226,6 +254,110 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
     }))
 }
 
+/// ローカルキュー → aggregator の中継タスク。
+///
+/// `event_tx` を無制限に `.await` してよい唯一の場所。ここが詰まっても
+/// protocol task の control plane(ping/pong/watchdog)は止まらない。
+///
+/// 終了条件は2つ:
+/// 1. protocol 側が `local_tx` を drop した(接続タスク自体の終了)。
+/// 2. `event_tx` がクローズした(aggregator が消えた)。
+///
+/// どちらでも `rx` が drop されるため、protocol 側の `local_tx.reserve()` /
+/// `try_reserve()` が `Closed` を返す。これが「aggregator が消えた」の伝播経路。
+async fn forward_events(index: usize, mut rx: mpsc::Receiver<Event>, tx: mpsc::Sender<Event>) {
+    while let Some(event) = rx.recv().await {
+        if tx.send(event).await.is_err() {
+            tracing::warn!(conn = index, "event channel closed; ws forwarder exiting");
+            return;
+        }
+    }
+    tracing::debug!(conn = index, "ws forwarder finished (protocol task ended)");
+}
+
+/// forwarder タスクの生存期間を接続タスクに束ねる Drop ガード。
+///
+/// `WsConnectionGuard` / `PollActiveGuard` と同じ契約 — panic unwind でも
+/// future の drop(cancel)でも forwarder が孤児として残らない。
+/// abort のためキュー在中の Event はその時点で失われるが、これが起きるのは
+/// プロセス停止時か supervisor による再起動時に限られる。
+struct ForwarderGuard {
+    handle: JoinHandle<()>,
+}
+
+impl ForwarderGuard {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self { handle }
+    }
+}
+
+impl Drop for ForwarderGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// sink へのテキスト送信。`WRITE_TIMEOUT` を超えたらセッションを落とす。
+/// timeout 後の sink は不定状態だが、呼び出し側はセッションごと捨てる。
+async fn send_text<S>(sink: &mut S, text: String, what: &str) -> Result<(), DmdataError>
+where
+    S: Sink<Message> + Unpin,
+    <S as Sink<Message>>::Error: std::fmt::Display,
+{
+    match tokio::time::timeout(WRITE_TIMEOUT, sink.send(Message::text(text))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(DmdataError::Ws(format!("{what} send failed: {e}"))),
+        Err(_) => Err(DmdataError::Ws(format!(
+            "{what} send timed out after {}s",
+            WRITE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// ping tick 1回分。pong 待ちが残っていれば何もしない。
+async fn send_ping<S>(
+    sink: &mut S,
+    watchdog: &mut PingWatchdog,
+    index: usize,
+) -> Result<(), DmdataError>
+where
+    S: Sink<Message> + Unpin,
+    <S as Sink<Message>>::Error: std::fmt::Display,
+{
+    let Some(ping) = watchdog.next_ping(tokio::time::Instant::now()) else {
+        return Ok(());
+    };
+    tracing::trace!(conn = index, ping_id = %ping.ping_id, "ws watchdog ping");
+    send_text(sink, ping.to_json(), "ping").await
+}
+
+/// watchdog 発火時の後始末。残存ソケットを非同期で閉じ、セッションのエラーを返す。
+fn on_watchdog_timeout(
+    api: &DmdataApi,
+    index: usize,
+    socket_id: Option<i64>,
+    pong_timeout: Duration,
+) -> DmdataError {
+    tracing::warn!(
+        conn = index,
+        timeout_secs = pong_timeout.as_secs(),
+        "pong watchdog timed out; dropping session"
+    );
+    spawn_socket_close(api, index, socket_id);
+    DmdataError::Ws(format!(
+        "pong not received within {}s",
+        pong_timeout.as_secs()
+    ))
+}
+
+/// `deadline` が無ければ永久に待つ(= select! のそのアームを無効化する)。
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// WS接続タスク: 認可→接続→受信ループを繰り返す。切断時は指数バックオフで再接続。
 pub async fn run_connection(
     index: usize,
@@ -245,10 +377,17 @@ pub async fn run_connection(
     let multiplier = cfg.reconnect.multiplier.max(1.0);
     let mut backoff = initial_backoff;
 
+    // ローカルキューは接続タスク全体で1本。再接続バックオフ中も forwarder が
+    // 走り続けるため、セッション終了時にキュー在中だった Event は捨てずに済む。
+    let (local_tx, local_rx) = mpsc::channel::<Event>(LOCAL_QUEUE_CAPACITY);
+    let _forwarder = ForwarderGuard::new(tokio::spawn(forward_events(index, local_rx, tx.clone())));
+
     loop {
-        let session = run_session(index, &endpoint, &api, &app_name, &tx, &state).await;
+        let session = run_session(index, &endpoint, &api, &app_name, &local_tx, &state).await;
         state.readiness.mark_ws_disconnected(index);
-        if tx.is_closed() {
+        // `tx` は本物の event_tx クローン。aggregator の消滅はここで直接見る。
+        // `local_tx` 側は forwarder が先に落ちたケース(同じ原因だが伝播が非同期)。
+        if tx.is_closed() || local_tx.is_closed() {
             tracing::warn!(conn = index, "event channel closed; ws task exiting");
             return TaskExit::Done;
         }
@@ -278,7 +417,7 @@ async fn run_session(
     endpoint: &str,
     api: &DmdataApi,
     app_name: &str,
-    tx: &mpsc::Sender<Event>,
+    local_tx: &mpsc::Sender<Event>,
     state: &SharedState,
 ) -> Result<bool, DmdataError> {
     let cfg = &state.config.dmdata;
@@ -330,14 +469,44 @@ async fn run_session(
 
     let (mut sink, mut stream) = ws.split();
 
-    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    let ping_every = Duration::from_secs(cfg.ws_ping_interval_secs.max(1));
+    let pong_timeout = Duration::from_secs(cfg.ws_pong_timeout_secs.max(1));
+    let mut ping_interval = tokio::time::interval(ping_every);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut watchdog = PingWatchdog::new(index);
+    let mut watchdog = PingWatchdog::with_timeout(index, pong_timeout);
+    let mut pending: Option<Event> = None;
+    let mut stalled_since: Option<tokio::time::Instant> = None;
 
     // 受信ループ。WSプロトコルPingはtungsteniteが自動Pongするが、
     // そのためにもストリームをpollし続ける必要がある。
     loop {
         let deadline = watchdog.deadline();
+        if let Some(event) = pending.take() {
+            tokio::select! {
+                permit = local_tx.reserve() => {
+                    let permit = permit
+                        .map_err(|_| DmdataError::Ws("event channel closed".into()))?;
+                    permit.send(event);
+                    if let Some(since) = stalled_since.take() {
+                        tracing::info!(
+                            conn = index,
+                            stalled_ms = since.elapsed().as_millis() as u64,
+                            "aggregator backpressure cleared; ws read resumed"
+                        );
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    // 同一 local を複数アームで move してよい(実行されるのは1アームのみ)
+                    pending = Some(event);
+                    send_ping(&mut sink, &mut watchdog, index).await?;
+                }
+                () = sleep_until_opt(deadline) => {
+                    return Err(on_watchdog_timeout(api, index, socket_id, pong_timeout));
+                }
+            }
+            continue;
+        }
+
         tokio::select! {
             item = stream.next() => {
                 let Some(item) = item else { break };
@@ -353,9 +522,7 @@ async fn run_session(
                             state.readiness.mark_ws_connected(index);
                         }
                         WsAction::Reply(json) => {
-                            sink.send(Message::text(json))
-                                .await
-                                .map_err(|e| DmdataError::Ws(format!("send failed: {e}")))?;
+                            send_text(&mut sink, json, "pong").await?;
                         }
                         WsAction::Pong { ping_id } => {
                             if watchdog.on_pong(ping_id.as_deref()) {
@@ -365,9 +532,20 @@ async fn run_session(
                             }
                         }
                         WsAction::Publish(event) => {
-                            // send().await で取りこぼしなく送る(try_sendは使わない)
-                            if tx.send(*event).await.is_err() {
-                                return Err(DmdataError::Ws("event channel closed".into()));
+                            match local_tx.try_reserve() {
+                                Ok(permit) => permit.send(*event),
+                                Err(mpsc::error::TrySendError::Full(())) => {
+                                    tracing::warn!(
+                                        conn = index,
+                                        capacity = LOCAL_QUEUE_CAPACITY,
+                                        "aggregator backpressure; ws read paused"
+                                    );
+                                    stalled_since = Some(tokio::time::Instant::now());
+                                    pending = Some(*event);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(())) => {
+                                    return Err(DmdataError::Ws("event channel closed".into()));
+                                }
                             }
                         }
                         WsAction::Close { reason } => {
@@ -383,21 +561,10 @@ async fn run_session(
                 }
             }
             _ = ping_interval.tick() => {
-                if let Some(ping) = watchdog.next_ping(tokio::time::Instant::now()) {
-                    sink.send(Message::text(ping.to_json()))
-                        .await
-                        .map_err(|e| DmdataError::Ws(format!("ping send failed: {e}")))?;
-                }
+                send_ping(&mut sink, &mut watchdog, index).await?;
             }
-            () = async move {
-                match deadline {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
-                spawn_socket_close(api, index, socket_id);
-                return Err(DmdataError::Ws("pong not received within 60s".into()));
+            () = sleep_until_opt(deadline) => {
+                return Err(on_watchdog_timeout(api, index, socket_id, pong_timeout));
             }
         }
     }
@@ -440,6 +607,15 @@ fn spawn_socket_close(api: &DmdataApi, index: usize, socket_id: Option<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// config/default.toml の既定値と同じ値。watchdogの算術を検証するためのもので、
+    /// 実行時の値は `dmdata.ws_ping_interval_secs` / `ws_pong_timeout_secs` から来る。
+    const PING_INTERVAL: Duration = Duration::from_secs(30);
+    const PONG_TIMEOUT: Duration = Duration::from_secs(60);
+
+    fn watchdog(conn: usize) -> PingWatchdog {
+        PingWatchdog::with_timeout(conn, PONG_TIMEOUT)
+    }
 
     const START_JSON: &str = include_str!("../../tests/fixtures/ws_start.json");
     const PING_JSON: &str = include_str!("../../tests/fixtures/ws_ping.json");
@@ -552,7 +728,7 @@ mod tests {
     #[test]
     fn next_ping_returns_none_while_pong_is_outstanding() {
         let now = tokio::time::Instant::now();
-        let mut watchdog = PingWatchdog::new(0);
+        let mut watchdog = watchdog(0);
         let ping = watchdog.next_ping(now).expect("first ping");
         assert_eq!(ping.ping_id, "wd0-1");
         assert!(watchdog.next_ping(now + PING_INTERVAL).is_none());
@@ -561,7 +737,7 @@ mod tests {
     #[test]
     fn matching_pong_clears_pending() {
         let now = tokio::time::Instant::now();
-        let mut watchdog = PingWatchdog::new(0);
+        let mut watchdog = watchdog(0);
         watchdog.next_ping(now).expect("first ping");
         assert!(watchdog.on_pong(Some("wd0-1")));
         assert!(watchdog.deadline().is_none());
@@ -574,7 +750,7 @@ mod tests {
     #[test]
     fn unknown_pong_id_does_not_clear_pending() {
         let now = tokio::time::Instant::now();
-        let mut watchdog = PingWatchdog::new(0);
+        let mut watchdog = watchdog(0);
         watchdog.next_ping(now).expect("first ping");
         assert!(!watchdog.on_pong(Some("bogus")));
         assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
@@ -583,7 +759,7 @@ mod tests {
     #[test]
     fn pong_without_ping_id_is_not_acked() {
         let now = tokio::time::Instant::now();
-        let mut watchdog = PingWatchdog::new(0);
+        let mut watchdog = watchdog(0);
         watchdog.next_ping(now).expect("first ping");
         assert!(!watchdog.on_pong(None));
         assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
@@ -591,7 +767,7 @@ mod tests {
 
     #[test]
     fn pong_without_pending_ping_is_not_matched() {
-        let mut watchdog = PingWatchdog::new(0);
+        let mut watchdog = watchdog(0);
         assert!(!watchdog.on_pong(None));
         assert!(watchdog.deadline().is_none());
     }
@@ -600,10 +776,64 @@ mod tests {
     fn deadline_is_ping_sent_at_plus_timeout() {
         // 生存判定の起点はping送信時刻。初回猶予が30秒に縮まないことの回帰テスト。
         let now = tokio::time::Instant::now();
-        let mut watchdog = PingWatchdog::new(3);
+        let mut watchdog = watchdog(3);
         let ping = watchdog.next_ping(now).expect("first ping");
         assert_eq!(ping.ping_id, "wd3-1");
         assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
+    }
+
+    fn dummy_event(id: &str) -> Event {
+        Event {
+            source: EventSource::DmdataPoll,
+            dedup_key: DedupKey::TelegramId(id.into()),
+            xml_body: None,
+            meta: ItemMeta {
+                id: id.into(),
+                title: String::new(),
+                updated: String::new(),
+                author: String::new(),
+                content: String::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarder_relays_in_order_through_a_narrow_downstream() {
+        // 下流容量1 = 常に詰まる状態。それでも順序は保たれ1件も落ちない
+        let (local_tx, local_rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<Event>(1);
+        let handle = tokio::spawn(forward_events(0, local_rx, tx));
+
+        for id in ["a", "b", "c"] {
+            local_tx.send(dummy_event(id)).await.expect("send");
+        }
+        for id in ["a", "b", "c"] {
+            assert_eq!(rx.recv().await.expect("relayed").meta.id, id);
+        }
+
+        // local_tx を drop すれば forwarder は自然終了する
+        drop(local_tx);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forwarder must finish")
+            .expect("forwarder must not panic");
+    }
+
+    #[tokio::test]
+    async fn downstream_close_propagates_to_local_tx() {
+        // 「aggregator が消えた」の伝播経路: rx drop → forwarder 終了 →
+        // local_rx drop → protocol 側の reserve() が Closed を返す
+        let (local_tx, local_rx) = mpsc::channel::<Event>(8);
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        tokio::spawn(forward_events(0, local_rx, tx));
+        drop(rx);
+
+        // 1件送ると forwarder がそれを下流へ送ろうとして閉鎖を検知する
+        local_tx.send(dummy_event("a")).await.expect("first send");
+        tokio::time::timeout(Duration::from_secs(1), local_tx.closed())
+            .await
+            .expect("local_tx must observe closure");
+        assert!(local_tx.reserve().await.is_err());
     }
 
     #[test]

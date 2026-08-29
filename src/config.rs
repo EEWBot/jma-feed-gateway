@@ -82,6 +82,11 @@ pub struct DmdataConfig {
     /// Originヘッダ(任意)。
     pub origin: Option<String>,
     pub cleanup_stale_sockets: bool,
+    /// watchdog ping の送信周期(秒)。
+    pub ws_ping_interval_secs: u64,
+    /// pong 未達でセッションを落とすまでの猶予(秒)。起点は ping 送信時刻。
+    /// `ws_ping_interval_secs` より大きいこと。
+    pub ws_pong_timeout_secs: u64,
     pub reconnect: ReconnectConfig,
 }
 
@@ -161,6 +166,16 @@ impl Config {
         if self.dmdata.ws_endpoints.is_empty() || self.dmdata.ws_endpoints.len() > 2 {
             return Err(ConfigError::Invalid(
                 "dmdata.ws_endpoints must contain 1 or 2 endpoints".into(),
+            ));
+        }
+        if self.dmdata.ws_ping_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "dmdata.ws_ping_interval_secs must be > 0".into(),
+            ));
+        }
+        if self.dmdata.ws_pong_timeout_secs <= self.dmdata.ws_ping_interval_secs {
+            return Err(ConfigError::Invalid(
+                "dmdata.ws_pong_timeout_secs must be > dmdata.ws_ping_interval_secs".into(),
             ));
         }
         if self.poll.interval_secs == 0 {
