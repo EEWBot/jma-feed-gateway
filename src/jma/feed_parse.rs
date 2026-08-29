@@ -36,20 +36,20 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
         })? {
             XmlEvent::Start(e) => {
                 let name = e.local_name();
-                let name = name.as_ref();
-                if name == b"entry" {
+                let name = name.into_inner();
+                if name == "entry" {
                     current = Some(ItemMeta::default());
                 } else if current.is_some() {
                     field = match name {
-                        b"title" => Some(Field::Title),
-                        b"id" => Some(Field::Id),
-                        b"updated" => Some(Field::Updated),
-                        b"content" => Some(Field::Content),
-                        b"author" => {
+                        "title" => Some(Field::Title),
+                        "id" => Some(Field::Id),
+                        "updated" => Some(Field::Updated),
+                        "content" => Some(Field::Content),
+                        "author" => {
                             in_author = true;
                             None
                         }
-                        b"name" if in_author => Some(Field::AuthorName),
+                        "name" if in_author => Some(Field::AuthorName),
                         _ => None,
                     };
                     text.clear();
@@ -57,10 +57,8 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
             }
             XmlEvent::Text(e) => {
                 if field.is_some() {
-                    text.push_str(
-                        &e.decode()
-                            .map_err(|e| UpstreamError::Parse(e.to_string()))?,
-                    );
+                    // quick-xml 0.42 以降、テキストは常に UTF-8 の `&str` として得られる
+                    text.push_str(e.as_ref());
                 }
             }
             XmlEvent::GeneralRef(e) => {
@@ -71,8 +69,8 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
             }
             XmlEvent::End(e) => {
                 let name = e.local_name();
-                let name = name.as_ref();
-                if name == b"entry" {
+                let name = name.into_inner();
+                if name == "entry" {
                     if let Some(meta) = current.take()
                         && !meta.id.is_empty()
                     {
@@ -80,7 +78,7 @@ pub fn parse(xml: &str) -> Result<Vec<ItemMeta>, UpstreamError> {
                     }
                     in_author = false;
                     field = None;
-                } else if name == b"author" {
+                } else if name == "author" {
                     in_author = false;
                 } else if let (Some(f), Some(meta)) = (field.take(), current.as_mut()) {
                     let value = std::mem::take(&mut text).trim().to_string();

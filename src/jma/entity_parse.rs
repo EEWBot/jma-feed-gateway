@@ -45,15 +45,13 @@ pub fn parse_entity_meta(xml: &str) -> Result<EntityMeta, UpstreamError> {
             UpstreamError::Parse(format!("xml error at {}: {e}", reader.error_position()))
         })? {
             XmlEvent::Start(e) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let name = e.local_name().into_inner().to_owned();
                 stack.push(name);
                 buf.clear();
             }
             XmlEvent::Text(e) => {
-                buf.push_str(
-                    &e.decode()
-                        .map_err(|e| UpstreamError::Parse(e.to_string()))?,
-                );
+                // quick-xml 0.42 以降、テキストは常に UTF-8 の `&str` として得られる
+                buf.push_str(e.as_ref());
             }
             XmlEvent::GeneralRef(e) => {
                 buf.push_str(&resolve_entity_ref(&e)?);
