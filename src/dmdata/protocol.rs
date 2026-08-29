@@ -40,24 +40,32 @@ pub struct WsPing {
     pub ping_id: Option<String>,
 }
 
-/// DMDATAのJSON ping への応答。`{"type":"pong","pingId":<同値>}` を返す。
-/// (WSプロトコルレベルのping/pongとは別物。プロトコルpingはtungsteniteが自動応答する)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// サーバから受け取る pong。自分が送った watchdog ping の応答。
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WsPong {
-    #[serde(rename = "type")]
-    pub message_type: PongType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ping_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// DMDATAのJSON ping への応答。`{"type":"pong","pingId":<同値>}` を返す。
+/// (WSプロトコルレベルのping/pongとは別物。プロトコルpingはtungsteniteが自動応答する)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsClientPong {
+    #[serde(rename = "type")]
+    pub message_type: PongType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ping_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PongType {
     Pong,
 }
 
-impl WsPong {
+impl WsClientPong {
     pub fn reply_to(ping: &WsPing) -> Self {
         Self {
             message_type: PongType::Pong,
@@ -66,7 +74,38 @@ impl WsPong {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("WsPong serialization cannot fail")
+        serde_json::to_string(self).expect("WsClientPong serialization cannot fail")
+    }
+}
+
+/// クライアント発の watchdog ping。`{"type":"ping","pingId":"..."}` を送り、
+/// サーバから同じ pingId の pong が返ることで接続の生存を確認する。
+/// (WSプロトコルレベルのping/pongとは別物)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsClientPing {
+    #[serde(rename = "type")]
+    pub message_type: PingType,
+    /// dmdata仕様: 64バイトまで。
+    pub ping_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PingType {
+    Ping,
+}
+
+impl WsClientPing {
+    pub fn new(ping_id: String) -> Self {
+        Self {
+            message_type: PingType::Ping,
+            ping_id,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("WsClientPing serialization cannot fail")
     }
 }
 
@@ -209,7 +248,7 @@ mod tests {
         };
         assert_eq!(ping.ping_id.as_deref(), Some("nBglV1"));
 
-        let pong = WsPong::reply_to(&ping).to_json();
+        let pong = WsClientPong::reply_to(&ping).to_json();
         let value: serde_json::Value = serde_json::from_str(&pong).unwrap();
         assert_eq!(value["type"], "pong");
         assert_eq!(value["pingId"], "nBglV1");
@@ -223,8 +262,14 @@ mod tests {
         };
         assert!(ping.ping_id.is_none());
 
-        let pong = WsPong::reply_to(&ping).to_json();
+        let pong = WsClientPong::reply_to(&ping).to_json();
         assert_eq!(pong, r#"{"type":"pong"}"#);
+    }
+
+    #[test]
+    fn client_ping_serializes_with_type_and_ping_id() {
+        let json = WsClientPing::new("wd0-1".into()).to_json();
+        assert_eq!(json, r#"{"type":"ping","pingId":"wd0-1"}"#);
     }
 
     #[test]

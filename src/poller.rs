@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use crate::error::DmdataError;
 use crate::fetcher;
-use crate::state::SharedState;
+use crate::state::{PollActiveGuard, SharedState};
+use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta};
 
 /// pollerの状態。壁時計ループ(`run`)とは分離してテスト可能にする。
@@ -148,15 +149,16 @@ impl Poller {
 /// `interval_secs` 秒周期でpollし、`ws_recovered` 通知でのwakeは全断エピソードからの
 /// 復帰を意味し、tick時刻を待たずにcatch-up pollを走らせる(コールドスタートの初回
 /// 接続はエピソード無しのため通知されない)。
-pub async fn run(state: SharedState) {
+pub async fn run(state: SharedState) -> TaskExit {
     let poll_config = &state.config.poll;
     if !poll_config.enabled {
         tracing::info!("poll fallback disabled by config");
-        return;
+        return TaskExit::Done;
     }
     let interval_secs = poll_config.interval_secs;
     tracing::info!(interval_secs, "poll fallback task started");
 
+    let _poll_guard = PollActiveGuard::new(state.clone());
     let mut poller = Poller::new(state.clone());
     loop {
         let wait = Duration::from_secs(interval_secs);
@@ -172,7 +174,7 @@ pub async fn run(state: SharedState) {
         if state.event_tx.is_closed() {
             poller.set_active(false);
             tracing::warn!("event channel closed; poll task exiting");
-            return;
+            return TaskExit::Done;
         }
 
         let fallback = state.readiness.all_ws_down();

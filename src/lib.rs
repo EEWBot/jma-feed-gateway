@@ -14,6 +14,7 @@
 //! - [`dmdata`][]: DMDATA.JP REST API / WebSocket連携
 //! - [`poller`][]: 全WS切断中の dmdata telegram.list pollingフォールバック
 //! - [`aggregator`][]: 唯一の書き込み点となる単一タスク
+//! - [`supervisor`][]: バックグラウンドタスクのpanic監視・再起動・致命時シャットダウン
 
 pub mod aggregator;
 pub mod config;
@@ -24,4 +25,5 @@ pub mod http;
 pub mod jma;
 pub mod poller;
 pub mod state;
+pub mod supervisor;
 pub mod types;

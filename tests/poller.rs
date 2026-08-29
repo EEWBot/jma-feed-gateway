@@ -21,7 +21,8 @@ use jma_feed_gateway::aggregator;
 use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::poller::Poller;
-use jma_feed_gateway::state::{AppState, SharedState};
+use jma_feed_gateway::state::{AppState, PollActiveGuard, SharedState};
+use jma_feed_gateway::supervisor::{RestartPolicy, Shutdown, spawn_supervised};
 use jma_feed_gateway::types::{DedupKey, Event, EventSource, ItemMeta};
 
 const LIST_PATH: &str = "/telegram";
@@ -518,4 +519,41 @@ async fn polled_entry_is_meta_only_until_first_access() {
     let entry = pinned.expect("polled entry must be pinned after first access");
     assert_eq!(&entry.body[..], entity_xml(NEW_ID).as_bytes());
     // MockServer drop時に expect(1) が検証される(poller由来のfetchゼロの証明)
+}
+
+/// panic した瞬間に `poll_active` が落ちること — supervisor のバックオフも
+/// 再起動後の最初のtickも待たない。`initial` を60秒に取ることで、フラグを
+/// 落としたのが `PollActiveGuard` の Drop(panic unwind)だけだと確定させる。
+#[tokio::test]
+async fn poll_active_is_cleared_on_panic_without_waiting_for_backoff() {
+    let server = MockServer::start().await;
+    let (state, _rx, _poller) = setup(&server).await;
+
+    let task_state = state.clone();
+    let handle = spawn_supervised(
+        "poller-panicky".into(),
+        RestartPolicy {
+            initial: Duration::from_secs(60),
+            max: Duration::from_secs(60),
+            multiplier: 2.0,
+        },
+        Shutdown::new(),
+        move || {
+            let state = task_state.clone();
+            async move {
+                let _guard = PollActiveGuard::new(state.clone());
+                state.readiness.poll_active.store(true, Ordering::Relaxed);
+                panic!("injected panic while poll fallback is active");
+            }
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !state.readiness.poll_active.load(Ordering::Relaxed),
+        "panic unwind の時点で poll_active は落ちていること(backoffもtickも待たない)"
+    );
+    assert!(!state.readiness.snapshot().poll);
+
+    handle.abort();
 }

@@ -82,6 +82,15 @@ pub struct DmdataConfig {
     /// Originヘッダ(任意)。
     pub origin: Option<String>,
     pub cleanup_stale_sockets: bool,
+    /// watchdog ping の送信周期(秒)。
+    pub ws_ping_interval_secs: u64,
+    /// pong 未達でセッションを落とすまでの猶予(秒)。起点は ping 送信時刻。
+    /// `ws_ping_interval_secs` より大きいこと。
+    pub ws_pong_timeout_secs: u64,
+    /// connect 成功後 start 受信までの猶予(秒)。起点は WS 接続確立時刻。
+    /// DMDATA は接続成功時に start を送るため、来ないセッションは購読が
+    /// 確立していない。捨てて再接続する。
+    pub ws_start_timeout_secs: u64,
     pub reconnect: ReconnectConfig,
 }
 
@@ -163,6 +172,21 @@ impl Config {
                 "dmdata.ws_endpoints must contain 1 or 2 endpoints".into(),
             ));
         }
+        if self.dmdata.ws_ping_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "dmdata.ws_ping_interval_secs must be > 0".into(),
+            ));
+        }
+        if self.dmdata.ws_pong_timeout_secs <= self.dmdata.ws_ping_interval_secs {
+            return Err(ConfigError::Invalid(
+                "dmdata.ws_pong_timeout_secs must be > dmdata.ws_ping_interval_secs".into(),
+            ));
+        }
+        if self.dmdata.ws_start_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "dmdata.ws_start_timeout_secs must be > 0".into(),
+            ));
+        }
         if self.poll.interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "poll.interval_secs must be > 0".into(),
@@ -220,6 +244,9 @@ mod tests {
             assert_eq!(config.dmdata.fetch_timeout_secs, 30);
             assert_eq!(config.dmdata.retry_attempts, 5);
             assert_eq!(config.dmdata.retry_initial_backoff_ms, 1000);
+            assert_eq!(config.dmdata.ws_ping_interval_secs, 30);
+            assert_eq!(config.dmdata.ws_pong_timeout_secs, 60);
+            assert_eq!(config.dmdata.ws_start_timeout_secs, 30);
             assert!(config.poll.enabled);
             assert_eq!(config.poll.interval_secs, 60);
             assert_eq!(config.rate_limit.max_requests, 40);
@@ -325,6 +352,19 @@ mod tests {
         });
         figment::Jail::expect_with(|jail| {
             jail.set_env("JMA_FEED_GATEWAY__RATE_LIMIT__WINDOW_SECS", "0");
+            let result = Config::from_figment(
+                Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
+                    .merge(Env::prefixed(ENV_PREFIX).split("__")),
+            );
+            assert!(matches!(result, Err(ConfigError::Invalid(_))));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn zero_ws_start_timeout_rejected() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JMA_FEED_GATEWAY__DMDATA__WS_START_TIMEOUT_SECS", "0");
             let result = Config::from_figment(
                 Figment::from(Toml::string(DEFAULT_CONFIG_TOML))
                     .merge(Env::prefixed(ENV_PREFIX).split("__")),
