@@ -16,6 +16,7 @@ use crate::dmdata::protocol::{WsData, WsMessage, WsPong};
 use crate::error::DmdataError;
 use crate::jma::entity_parse::parse_entity_meta;
 use crate::state::SharedState;
+use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
@@ -169,7 +170,9 @@ pub async fn run_connection(
     endpoint: String,
     tx: mpsc::Sender<Event>,
     state: SharedState,
-) {
+) -> TaskExit {
+    state.readiness.mark_ws_disconnected(index);
+
     let cfg = &state.config.dmdata;
     let api = state.dmdata_api.clone();
     let app_name = format!("{}-{}", cfg.app_name, index + 1);
@@ -184,7 +187,7 @@ pub async fn run_connection(
         state.readiness.mark_ws_disconnected(index);
         if tx.is_closed() {
             tracing::warn!(conn = index, "event channel closed; ws task exiting");
-            return;
+            return TaskExit::Done;
         }
         match session {
             Ok(started) => {

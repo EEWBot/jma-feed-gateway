@@ -14,6 +14,7 @@ use jma_feed_gateway::config::Config;
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::error::{AppError, ConfigError};
 use jma_feed_gateway::state::AppState;
+use jma_feed_gateway::supervisor::{RestartPolicy, Shutdown, spawn_critical, spawn_supervised};
 use jma_feed_gateway::types::{DedupKey, Event};
 use jma_feed_gateway::{aggregator, dmdata, fetcher, http, poller};
 
@@ -78,8 +79,14 @@ async fn run() -> Result<(), AppError> {
         state.feed_ids.insert(meta.id.clone());
     }
 
-    // Aggregator(唯一の書き込み点)。初期一覧を渡してスナップショット生成を任せる
-    tokio::spawn(aggregator::run(initial_metas, event_rx, state.clone()));
+    let shutdown = Shutdown::new();
+
+    // Aggregator(唯一の書き込み点)。初期一覧を渡してスナップショット生成を任せる。
+    spawn_critical(
+        "aggregator".into(),
+        shutdown.clone(),
+        aggregator::run(initial_metas, event_rx, state.clone()),
+    );
     state
         .readiness
         .initial_feed_loaded
@@ -87,27 +94,53 @@ async fn run() -> Result<(), AppError> {
 
     // DMDATA WebSocket ×2(tokyo/osaka)
     for (index, endpoint) in config.dmdata.ws_endpoints.iter().enumerate() {
-        tokio::spawn(dmdata::ws::run_connection(
-            index,
-            endpoint.clone(),
-            event_tx.clone(),
-            state.clone(),
-        ));
+        let endpoint = endpoint.clone();
+        let tx = event_tx.clone();
+        let task_state = state.clone();
+        spawn_supervised(
+            format!("dmdata-ws-{index}"),
+            RestartPolicy::default(),
+            shutdown.clone(),
+            move || {
+                dmdata::ws::run_connection(index, endpoint.clone(), tx.clone(), task_state.clone())
+            },
+        );
     }
 
     // 全WS切断中のフォールバックpolling(enabled=falseならタスク内で終了)
-    tokio::spawn(poller::run(state.clone()));
+    {
+        let task_state = state.clone();
+        spawn_supervised(
+            "poller".into(),
+            RestartPolicy::default(),
+            shutdown.clone(),
+            move || poller::run(task_state.clone()),
+        );
+    }
 
     let app = http::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.http.bind_addr).await?;
     tracing::info!(addr = %config.http.bind_addr, "http server listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutdown signal received");
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("shutdown signal received");
+                    }
+                    _ = shutdown.wait() => {
+                        tracing::error!("internal shutdown triggered; stopping http server");
+                    }
+                }
+            }
         })
         .await?;
+
+    if let Some(reason) = shutdown.reason() {
+        return Err(AppError::CriticalTaskFailed(reason));
+    }
 
     Ok(())
 }

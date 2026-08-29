@@ -49,4 +49,6 @@ pub enum AppError {
     Client(#[from] reqwest::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("critical task failed: {0}")]
+    CriticalTaskFailed(String),
 }
