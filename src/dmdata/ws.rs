@@ -58,11 +58,10 @@ impl PingWatchdog {
     }
 
     fn on_pong(&mut self, ping_id: Option<&str>) -> bool {
-        let matched = match (&self.pending, ping_id) {
-            (Some(_), None) => true,
-            (Some(pending), Some(id)) => pending.id == id,
-            (None, _) => false,
-        };
+        let matched = matches!(
+            (&self.pending, ping_id),
+            (Some(pending), Some(id)) if pending.id == id
+        );
         if matched {
             self.pending = None;
         }
@@ -361,7 +360,7 @@ async fn run_session(
                             if watchdog.on_pong(ping_id.as_deref()) {
                                 tracing::trace!(conn = index, ?ping_id, "ws pong received");
                             } else {
-                                tracing::trace!(conn = index, ?ping_id, "unexpected pong id");
+                                tracing::warn!(conn = index, ?ping_id, "pong ignored: unexpected or missing pingId");
                             }
                         }
                         WsAction::Publish(event) => {
@@ -475,7 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn pong_without_ping_id_is_accepted() {
+    fn pong_without_ping_id_deserializes() {
+        // deserializeは通るが、watchdog ACKとしては扱わない
+        // (pong_without_ping_id_is_not_acked を参照)
         let WsAction::Pong { ping_id } = handle_ws_message(r#"{"type":"pong"}"#, 0) else {
             panic!("expected pong");
         };
@@ -579,12 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn pong_without_ping_id_clears_pending() {
+    fn pong_without_ping_id_is_not_acked() {
         let now = tokio::time::Instant::now();
         let mut watchdog = PingWatchdog::new(0);
         watchdog.next_ping(now).expect("first ping");
-        assert!(watchdog.on_pong(None));
-        assert!(watchdog.deadline().is_none());
+        assert!(!watchdog.on_pong(None));
+        assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
     }
 
     #[test]
