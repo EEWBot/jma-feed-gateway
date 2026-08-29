@@ -218,9 +218,9 @@ impl Drop for WsConnectionGuard {
 
 /// pollerタスクの生存期間に `poll_active` を束ねる Drop ガード。
 ///
-/// poller には WS 側の入口クリアに相当する処理が無いため、panic すると
-/// バックオフに加えて再起動後の最初のtickまで stale-true が残る。
-/// ガードは panic unwind の時点でこれを閉じる。
+/// ガードが無いと panic 時にバックオフに加えて再起動後の最初のtickまで
+/// stale-true が残る。ガードは panic unwind の時点でこれを閉じる
+/// (`WsConnectionGuard` と同じ契約)。
 pub struct PollActiveGuard {
     state: SharedState,
 }

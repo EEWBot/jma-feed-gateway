@@ -5,9 +5,9 @@
 //! 固着し、`/readyz` が200を返し続け、pollerフォールバックも起動しない
 //! (WSもpollも動いていないのに正常を主張する無音故障)。
 //!
-//! socket_start にわざと遅延を入れることで「セッションがまだ終わっていない」窓を
-//! 作り、その窓の中でreadinessが既にクリアされていることを確認する。
-//! run_connection 冒頭の mark_ws_disconnected が無いとこのテストは失敗する。
+//! フラグを落とすのは `WsConnectionGuard` の Drop だけ、というのが現在の契約。
+//! `run_connection` は冒頭で明示的なクリアをしない(それをするとコールドスタートが
+//! 全断エピソード扱いになり、初回接続で不要なcatch-up pollが走る)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,18 +63,15 @@ async fn setup(server: &MockServer, delay: Duration) -> (SharedState, mpsc::Rece
     )
 }
 
+/// コールドスタートの初回接続を「全断エピソードからの復帰」と誤認しないこと。
+///
+/// `run_connection` が冒頭で `mark_ws_disconnected` を呼ぶと `fully_down` が立ち、
+/// 最初の start で `ws_recovered` が通知されて不要なcatch-up pollが1回走る。
 #[tokio::test]
-async fn restarted_ws_task_clears_stale_connected_flag() {
+async fn cold_start_does_not_signal_ws_recovered() {
     let server = MockServer::start().await;
-    // セッションが終わらない十分な遅延。この窓の中でreadinessを観測する
+    // socket_start の遅延中 = まだ一度も接続していない窓
     let (state, _rx) = setup(&server, Duration::from_secs(30)).await;
-
-    // panicで死んだ前インスタンスが mark_ws_disconnected を通れなかった状況を再現
-    state.readiness.mark_ws_connected(0);
-    assert!(
-        !state.readiness.all_ws_down(),
-        "precondition: 接続済みフラグが立っていること"
-    );
 
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -86,16 +83,18 @@ async fn restarted_ws_task_clears_stale_connected_flag() {
         )
         .await
     });
-
-    // セッションはまだ socket_start の遅延中。それでも固着フラグは既に落ちているはず
     tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 初回の start 相当。エピソードが無いので通知されてはならない
+    state.readiness.mark_ws_connected(0);
     assert!(
-        state.readiness.all_ws_down(),
-        "再起動されたWSタスクは前インスタンスの ws_connected を引き継いではならない"
-    );
-    assert!(
-        !state.readiness.is_ready(),
-        "WSもpollも動いていない状態を readiness が正しく報告すること"
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            state.readiness.ws_recovered.notified(),
+        )
+        .await
+        .is_err(),
+        "コールドスタートの初回接続で ws_recovered を通知してはならない"
     );
 
     handle.abort();
@@ -157,8 +156,8 @@ async fn supervisor_does_not_restart_ws_task_that_returned_done() {
 
 /// panic した瞬間に `ws_connected` が落ちること — supervisor のバックオフを待たない。
 ///
-/// `initial` を60秒に取っているのが要点: 「再起動したタスクが冒頭の
-/// `mark_ws_disconnected` でクリアした」可能性を排除し、フラグを落としたのが
+/// `initial` を60秒に取っているのが要点: 再起動したタスクの後片付けが
+/// 観測窓に紛れ込む可能性を排除し、フラグを落としたのが
 /// `WsConnectionGuard` の Drop(panic unwind)だけだと確定させる。
 #[tokio::test]
 async fn ws_flag_is_cleared_on_panic_without_waiting_for_backoff() {

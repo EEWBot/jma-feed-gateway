@@ -365,7 +365,6 @@ pub async fn run_connection(
     tx: mpsc::Sender<Event>,
     state: SharedState,
 ) -> TaskExit {
-    state.readiness.mark_ws_disconnected(index);
     let _ws_guard = WsConnectionGuard::new(state.clone(), index);
 
     let cfg = &state.config.dmdata;
