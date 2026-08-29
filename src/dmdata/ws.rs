@@ -26,6 +26,9 @@
 //!   「静かに詰まったまま接続中を主張する」より「切れて poll fallback に渡す」を選ぶ。
 //! - sink への write は `WRITE_TIMEOUT` 付き。network write が固まったまま
 //!   watchdog へ戻れなくなるのを防ぐ。
+//! - connect 成功後 `start` が来ないセッションは `ws_start_timeout_secs` で落とす。
+//!   pong は返るが start は来ないサーバ相手だと watchdog は発火せず、readiness が
+//!   false のまま永久に維持されてしまうため。
 
 use std::time::Duration;
 
@@ -349,6 +352,35 @@ fn on_watchdog_timeout(
     ))
 }
 
+fn on_start_timeout(
+    api: &DmdataApi,
+    index: usize,
+    socket_id: Option<i64>,
+    start_timeout: Duration,
+) -> DmdataError {
+    tracing::warn!(
+        conn = index,
+        timeout_secs = start_timeout.as_secs(),
+        "start not received; dropping session"
+    );
+    spawn_socket_close(api, index, socket_id);
+    DmdataError::Ws(format!(
+        "start not received within {}s",
+        start_timeout.as_secs()
+    ))
+}
+
+/// 2つの deadline のうち先に来る方(片方が `None` ならもう一方)。
+fn earliest(
+    a: Option<tokio::time::Instant>,
+    b: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// `deadline` が無ければ永久に待つ(= select! のそのアームを無効化する)。
 async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
@@ -467,6 +499,8 @@ async fn run_session(
 
     let ping_every = Duration::from_secs(cfg.ws_ping_interval_secs.max(1));
     let pong_timeout = Duration::from_secs(cfg.ws_pong_timeout_secs.max(1));
+    let start_timeout = Duration::from_secs(cfg.ws_start_timeout_secs.max(1));
+    let mut start_deadline = Some(tokio::time::Instant::now() + start_timeout);
     let mut ping_interval = tokio::time::interval(ping_every);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_interval.tick().await;
@@ -477,7 +511,7 @@ async fn run_session(
     // 受信ループ。WSプロトコルPingはtungsteniteが自動Pongするが、
     // そのためにもストリームをpollし続ける必要がある。
     loop {
-        let deadline = watchdog.deadline();
+        let deadline = earliest(watchdog.deadline(), start_deadline);
         if let Some(event) = pending.take() {
             tokio::select! {
                 permit = local_tx.reserve() => {
@@ -498,6 +532,9 @@ async fn run_session(
                     send_ping(&mut sink, &mut watchdog, index).await?;
                 }
                 () = sleep_until_opt(deadline) => {
+                    if start_deadline.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                        return Err(on_start_timeout(api, index, socket_id, start_timeout));
+                    }
                     return Err(on_watchdog_timeout(api, index, socket_id, pong_timeout));
                 }
             }
@@ -515,6 +552,7 @@ async fn run_session(
                             if id.is_some() {
                                 socket_id = id;
                             }
+                            start_deadline = None;
                             // start受信=購読確立。全断エピソード後ならcatch-up pollが通知される
                             state.readiness.mark_ws_connected(index);
                         }
@@ -561,6 +599,9 @@ async fn run_session(
                 send_ping(&mut sink, &mut watchdog, index).await?;
             }
             () = sleep_until_opt(deadline) => {
+                if start_deadline.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                    return Err(on_start_timeout(api, index, socket_id, start_timeout));
+                }
                 return Err(on_watchdog_timeout(api, index, socket_id, pong_timeout));
             }
             () = local_tx.closed() => {
@@ -765,6 +806,18 @@ mod tests {
         let mut watchdog = watchdog(0);
         assert!(!watchdog.on_pong(None));
         assert!(watchdog.deadline().is_none());
+    }
+
+    #[test]
+    fn earliest_picks_the_nearer_deadline() {
+        let now = tokio::time::Instant::now();
+        let soon = now + Duration::from_secs(1);
+        let later = now + Duration::from_secs(2);
+        assert_eq!(earliest(None, None), None);
+        assert_eq!(earliest(Some(soon), None), Some(soon));
+        assert_eq!(earliest(None, Some(soon)), Some(soon));
+        assert_eq!(earliest(Some(later), Some(soon)), Some(soon));
+        assert_eq!(earliest(Some(soon), Some(later)), Some(soon));
     }
 
     #[test]
