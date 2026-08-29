@@ -469,6 +469,7 @@ async fn run_session(
     let pong_timeout = Duration::from_secs(cfg.ws_pong_timeout_secs.max(1));
     let mut ping_interval = tokio::time::interval(ping_every);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_interval.tick().await;
     let mut watchdog = PingWatchdog::with_timeout(index, pong_timeout);
     let mut pending: Option<Event> = None;
     let mut stalled_since: Option<tokio::time::Instant> = None;
