@@ -27,7 +27,6 @@
 //! - sink への write は `WRITE_TIMEOUT` 付き。network write が固まったまま
 //!   watchdog へ戻れなくなるのを防ぐ。
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -383,6 +382,9 @@ pub async fn run_connection(
 
     loop {
         let session = run_session(index, &endpoint, &api, &app_name, &local_tx, &state).await;
+        // フラグを落とす前に読む。start受信済み(=購読確立)なら、セッションの
+        // 終わり方がOk/Errどちらでもバックオフをリセットする対象。
+        let was_connected = state.readiness.is_ws_connected(index);
         state.readiness.mark_ws_disconnected(index);
         // `tx` は本物の event_tx クローン。aggregator の消滅はここで直接見る。
         // `local_tx` 側は forwarder が先に落ちたケース(同じ原因だが伝播が非同期)。
@@ -391,16 +393,12 @@ pub async fn run_connection(
             return TaskExit::Done;
         }
         match session {
-            Ok(started) => {
-                tracing::info!(conn = index, "ws session ended");
-                if started {
-                    // 接続確立まで到達したセッションの後はバックオフをリセット
-                    backoff = initial_backoff;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(conn = index, error = %e, "ws session failed");
-            }
+            Ok(()) => tracing::info!(conn = index, "ws session ended"),
+            Err(e) => tracing::warn!(conn = index, error = %e, "ws session failed"),
+        }
+        // 接続確立まで到達したセッションの後はバックオフをリセット
+        if was_connected {
+            backoff = initial_backoff;
         }
         let jitter = Duration::from_millis(rand::random_range(0..1000));
         tracing::info!(conn = index, backoff = ?backoff, "ws reconnecting after backoff");
@@ -410,7 +408,6 @@ pub async fn run_connection(
 }
 
 /// 1セッション分: (設定により)残存ソケット掃除 → socket_start → connect → 受信ループ。
-/// 戻り値はstartメッセージを受信したかどうか。
 async fn run_session(
     index: usize,
     endpoint: &str,
@@ -418,7 +415,7 @@ async fn run_session(
     app_name: &str,
     local_tx: &mpsc::Sender<Event>,
     state: &SharedState,
-) -> Result<bool, DmdataError> {
+) -> Result<(), DmdataError> {
     let cfg = &state.config.dmdata;
 
     // 同名appNameの残存ソケットを掃除(失敗しても続行)
@@ -568,12 +565,7 @@ async fn run_session(
         }
     }
 
-    Ok(state
-        .readiness
-        .ws_connected
-        .get(index)
-        .map(|flag| flag.load(Ordering::Relaxed))
-        .unwrap_or(false))
+    Ok(())
 }
 
 fn spawn_socket_close(api: &DmdataApi, index: usize, socket_id: Option<i64>) {

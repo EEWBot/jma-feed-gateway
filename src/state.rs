@@ -137,6 +137,13 @@ impl Readiness {
                 || self.poll_active.load(Ordering::Relaxed))
     }
 
+    /// 指定インデックスのWSが接続中か(範囲外は false)。
+    pub fn is_ws_connected(&self, index: usize) -> bool {
+        self.ws_connected
+            .get(index)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     /// 全WS切断中か(1本も接続していない)。
     pub fn all_ws_down(&self) -> bool {
         !self.ws_connected.iter().any(|b| b.load(Ordering::Relaxed))
