@@ -24,6 +24,58 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
+struct PendingPing {
+    id: String,
+    sent_at: tokio::time::Instant,
+}
+
+struct PingWatchdog {
+    conn: usize,
+    seq: u64,
+    pending: Option<PendingPing>,
+}
+
+impl PingWatchdog {
+    fn new(conn: usize) -> Self {
+        Self {
+            conn,
+            seq: 0,
+            pending: None,
+        }
+    }
+
+    fn next_ping(&mut self, now: tokio::time::Instant) -> Option<WsClientPing> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.seq += 1;
+        let id = format!("wd{}-{}", self.conn, self.seq);
+        self.pending = Some(PendingPing {
+            id: id.clone(),
+            sent_at: now,
+        });
+        Some(WsClientPing::new(id))
+    }
+
+    fn on_pong(&mut self, ping_id: Option<&str>) -> bool {
+        let matched = match (&self.pending, ping_id) {
+            (Some(_), None) => true,
+            (Some(pending), Some(id)) => pending.id == id,
+            (None, _) => false,
+        };
+        if matched {
+            self.pending = None;
+        }
+        matched
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.sent_at + PONG_TIMEOUT)
+    }
+}
+
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
 #[derive(Debug)]
 pub enum WsAction {
@@ -278,17 +330,14 @@ async fn run_session(
 
     let (mut sink, mut stream) = ws.split();
 
-    // クライアント発pingのwatchdog。TCPは生きているが電文が流れない「半死」接続を
-    // 検出し、セッションを落として run_connection の再接続ループに戻す。
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping_interval.tick().await; // intervalの初回即時tickを捨てる
-    let mut last_pong = tokio::time::Instant::now();
-    let mut ping_seq: u64 = 0;
+    let mut watchdog = PingWatchdog::new(index);
 
     // 受信ループ。WSプロトコルPingはtungsteniteが自動Pongするが、
     // そのためにもストリームをpollし続ける必要がある。
     loop {
+        let deadline = watchdog.deadline();
         tokio::select! {
             item = stream.next() => {
                 let Some(item) = item else { break };
@@ -309,8 +358,11 @@ async fn run_session(
                                 .map_err(|e| DmdataError::Ws(format!("send failed: {e}")))?;
                         }
                         WsAction::Pong { ping_id } => {
-                            tracing::trace!(conn = index, ?ping_id, "ws pong received");
-                            last_pong = tokio::time::Instant::now();
+                            if watchdog.on_pong(ping_id.as_deref()) {
+                                tracing::trace!(conn = index, ?ping_id, "ws pong received");
+                            } else {
+                                tracing::trace!(conn = index, ?ping_id, "unexpected pong id");
+                            }
                         }
                         WsAction::Publish(event) => {
                             // send().await で取りこぼしなく送る(try_sendは使わない)
@@ -331,16 +383,21 @@ async fn run_session(
                 }
             }
             _ = ping_interval.tick() => {
-                if last_pong.elapsed() >= PONG_TIMEOUT {
-                    tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
-                    spawn_socket_close(api, index, socket_id);
-                    return Err(DmdataError::Ws("pong not received within 60s".into()));
+                if let Some(ping) = watchdog.next_ping(tokio::time::Instant::now()) {
+                    sink.send(Message::text(ping.to_json()))
+                        .await
+                        .map_err(|e| DmdataError::Ws(format!("ping send failed: {e}")))?;
                 }
-                ping_seq += 1;
-                let ping = WsClientPing::new(format!("wd{index}-{ping_seq}"));
-                sink.send(Message::text(ping.to_json()))
-                    .await
-                    .map_err(|e| DmdataError::Ws(format!("ping send failed: {e}")))?;
+            }
+            () = async move {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
+                spawn_socket_close(api, index, socket_id);
+                return Err(DmdataError::Ws("pong not received within 60s".into()));
             }
         }
     }
@@ -488,6 +545,63 @@ mod tests {
         value["head"]["test"] = serde_json::Value::Bool(true);
         let text = value.to_string();
         assert!(matches!(handle_ws_message(&text, 0), WsAction::None));
+    }
+
+    #[test]
+    fn next_ping_returns_none_while_pong_is_outstanding() {
+        let now = tokio::time::Instant::now();
+        let mut watchdog = PingWatchdog::new(0);
+        let ping = watchdog.next_ping(now).expect("first ping");
+        assert_eq!(ping.ping_id, "wd0-1");
+        assert!(watchdog.next_ping(now + PING_INTERVAL).is_none());
+    }
+
+    #[test]
+    fn matching_pong_clears_pending() {
+        let now = tokio::time::Instant::now();
+        let mut watchdog = PingWatchdog::new(0);
+        watchdog.next_ping(now).expect("first ping");
+        assert!(watchdog.on_pong(Some("wd0-1")));
+        assert!(watchdog.deadline().is_none());
+        let ping = watchdog
+            .next_ping(now + PING_INTERVAL)
+            .expect("second ping");
+        assert_eq!(ping.ping_id, "wd0-2");
+    }
+
+    #[test]
+    fn unknown_pong_id_does_not_clear_pending() {
+        let now = tokio::time::Instant::now();
+        let mut watchdog = PingWatchdog::new(0);
+        watchdog.next_ping(now).expect("first ping");
+        assert!(!watchdog.on_pong(Some("bogus")));
+        assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
+    }
+
+    #[test]
+    fn pong_without_ping_id_clears_pending() {
+        let now = tokio::time::Instant::now();
+        let mut watchdog = PingWatchdog::new(0);
+        watchdog.next_ping(now).expect("first ping");
+        assert!(watchdog.on_pong(None));
+        assert!(watchdog.deadline().is_none());
+    }
+
+    #[test]
+    fn pong_without_pending_ping_is_not_matched() {
+        let mut watchdog = PingWatchdog::new(0);
+        assert!(!watchdog.on_pong(None));
+        assert!(watchdog.deadline().is_none());
+    }
+
+    #[test]
+    fn deadline_is_ping_sent_at_plus_timeout() {
+        // 生存判定の起点はping送信時刻。初回猶予が30秒に縮まないことの回帰テスト。
+        let now = tokio::time::Instant::now();
+        let mut watchdog = PingWatchdog::new(3);
+        let ping = watchdog.next_ping(now).expect("first ping");
+        assert_eq!(ping.ping_id, "wd3-1");
+        assert_eq!(watchdog.deadline(), Some(now + PONG_TIMEOUT));
     }
 
     #[test]
