@@ -57,7 +57,10 @@ async fn setup(server: &MockServer, delay: Duration) -> (SharedState, mpsc::Rece
         "test-api-key",
         None,
     );
-    (Arc::new(AppState::new(Arc::new(config), dmdata_api, tx)), rx)
+    (
+        Arc::new(AppState::new(Arc::new(config), dmdata_api, tx)),
+        rx,
+    )
 }
 
 #[tokio::test]
@@ -75,8 +78,13 @@ async fn restarted_ws_task_clears_stale_connected_flag() {
 
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
-        ws::run_connection(0, "ws://127.0.0.1:1".into(), task_state.event_tx.clone(), task_state)
-            .await
+        ws::run_connection(
+            0,
+            "ws://127.0.0.1:1".into(),
+            task_state.event_tx.clone(),
+            task_state,
+        )
+        .await
     });
 
     // セッションはまだ socket_start の遅延中。それでも固着フラグは既に落ちているはず

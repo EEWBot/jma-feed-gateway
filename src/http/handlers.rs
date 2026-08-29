@@ -218,10 +218,7 @@ pub async fn upstream_redirect(
     };
     (
         StatusCode::TEMPORARY_REDIRECT,
-        [
-            (header::LOCATION, value),
-            (header::CACHE_CONTROL, NO_STORE),
-        ],
+        [(header::LOCATION, value), (header::CACHE_CONTROL, NO_STORE)],
     )
         .into_response()
 }

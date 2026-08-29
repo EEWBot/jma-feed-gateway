@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::dmdata::api::{DmdataApi, SocketStartRequest};
 use crate::dmdata::body::decode_body;
-use crate::dmdata::protocol::{WsData, WsMessage, WsPong};
+use crate::dmdata::protocol::{WsClientPing, WsClientPong, WsData, WsMessage};
 use crate::error::DmdataError;
 use crate::jma::entity_parse::parse_entity_meta;
 use crate::state::SharedState;
@@ -20,6 +20,8 @@ use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
 #[derive(Debug)]
@@ -30,6 +32,8 @@ pub enum WsAction {
     Started,
     /// テキストを返信する(DMDATAのJSON pingへのpong応答)。
     Reply(String),
+    /// pong受信。watchdogの生存タイマをリセットする。
+    Pong { ping_id: Option<String> },
     /// Event を aggregator へ送る。
     Publish(Box<Event>),
     /// サーバ指示によりクローズして再接続する。
@@ -53,9 +57,11 @@ pub fn handle_ws_message(text: &str, conn_index: usize) -> WsAction {
         WsMessage::Ping(ping) => {
             // DMDATAのJSON pingにはJSONで応答する(WSプロトコルpingとは別物)
             tracing::trace!(conn = conn_index, ping_id = ?ping.ping_id, "ws ping");
-            WsAction::Reply(WsPong::reply_to(&ping).to_json())
+            WsAction::Reply(WsClientPong::reply_to(&ping).to_json())
         }
-        WsMessage::Pong(_) => WsAction::None,
+        WsMessage::Pong(pong) => WsAction::Pong {
+            ping_id: pong.ping_id,
+        },
         WsMessage::Error(error) => {
             tracing::error!(conn = conn_index, code = ?error.code, message = ?error.error, close = error.close, "ws error message");
             if error.close {
@@ -268,38 +274,66 @@ async fn run_session(
 
     let (mut sink, mut stream) = ws.split();
 
+    // クライアント発pingのwatchdog。TCPは生きているが電文が流れない「半死」接続を
+    // 検出し、セッションを落として run_connection の再接続ループに戻す。
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_interval.tick().await; // intervalの初回即時tickを捨てる
+    let mut last_pong = tokio::time::Instant::now();
+    let mut ping_seq: u64 = 0;
+
     // 受信ループ。WSプロトコルPingはtungsteniteが自動Pongするが、
     // そのためにもストリームをpollし続ける必要がある。
-    while let Some(item) = stream.next().await {
-        let message = item.map_err(|e| DmdataError::Ws(format!("receive failed: {e}")))?;
-        match message {
-            Message::Text(text) => match handle_ws_message(text.as_str(), index) {
-                WsAction::None => {}
-                WsAction::Started => {
-                    // start受信=購読確立。全断エピソード後ならcatch-up pollが通知される
-                    state.readiness.mark_ws_connected(index);
-                }
-                WsAction::Reply(json) => {
-                    sink.send(Message::text(json))
-                        .await
-                        .map_err(|e| DmdataError::Ws(format!("send failed: {e}")))?;
-                }
-                WsAction::Publish(event) => {
-                    // send().await で取りこぼしなく送る(try_sendは使わない)
-                    if tx.send(*event).await.is_err() {
-                        return Err(DmdataError::Ws("event channel closed".into()));
+    loop {
+        tokio::select! {
+            item = stream.next() => {
+                let Some(item) = item else { break };
+                let message = item.map_err(|e| DmdataError::Ws(format!("receive failed: {e}")))?;
+                match message {
+                    Message::Text(text) => match handle_ws_message(text.as_str(), index) {
+                        WsAction::None => {}
+                        WsAction::Started => {
+                            // start受信=購読確立。全断エピソード後ならcatch-up pollが通知される
+                            state.readiness.mark_ws_connected(index);
+                        }
+                        WsAction::Reply(json) => {
+                            sink.send(Message::text(json))
+                                .await
+                                .map_err(|e| DmdataError::Ws(format!("send failed: {e}")))?;
+                        }
+                        WsAction::Pong { ping_id } => {
+                            tracing::trace!(conn = index, ?ping_id, "ws pong received");
+                            last_pong = tokio::time::Instant::now();
+                        }
+                        WsAction::Publish(event) => {
+                            // send().await で取りこぼしなく送る(try_sendは使わない)
+                            if tx.send(*event).await.is_err() {
+                                return Err(DmdataError::Ws("event channel closed".into()));
+                            }
+                        }
+                        WsAction::Close { reason } => {
+                            return Err(DmdataError::Ws(format!("server requested close: {reason}")));
+                        }
+                    },
+                    Message::Close(frame) => {
+                        tracing::info!(conn = index, frame = ?frame, "ws closed by server");
+                        break;
                     }
+                    // Ping/Pong/Binary等は無視(プロトコルPingは自動応答)
+                    _ => {}
                 }
-                WsAction::Close { reason } => {
-                    return Err(DmdataError::Ws(format!("server requested close: {reason}")));
-                }
-            },
-            Message::Close(frame) => {
-                tracing::info!(conn = index, frame = ?frame, "ws closed by server");
-                break;
             }
-            // Ping/Pong/Binary等は無視(プロトコルPingは自動応答)
-            _ => {}
+            _ = ping_interval.tick() => {
+                if last_pong.elapsed() >= PONG_TIMEOUT {
+                    tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
+                    return Err(DmdataError::Ws("pong not received within 60s".into()));
+                }
+                ping_seq += 1;
+                let ping = WsClientPing::new(format!("wd{index}-{ping_seq}"));
+                sink.send(Message::text(ping.to_json()))
+                    .await
+                    .map_err(|e| DmdataError::Ws(format!("ping send failed: {e}")))?;
+            }
         }
     }
 
@@ -336,6 +370,24 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["type"], "pong");
         assert_eq!(value["pingId"], "nBglV1");
+    }
+
+    #[test]
+    fn pong_returns_pong_action() {
+        let WsAction::Pong { ping_id } =
+            handle_ws_message(r#"{"type":"pong","pingId":"wd0-1"}"#, 0)
+        else {
+            panic!("expected pong");
+        };
+        assert_eq!(ping_id.as_deref(), Some("wd0-1"));
+    }
+
+    #[test]
+    fn pong_without_ping_id_is_accepted() {
+        let WsAction::Pong { ping_id } = handle_ws_message(r#"{"type":"pong"}"#, 0) else {
+            panic!("expected pong");
+        };
+        assert!(ping_id.is_none());
     }
 
     #[test]
