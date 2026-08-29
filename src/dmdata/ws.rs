@@ -22,6 +22,7 @@ use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(60);
+const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
 #[derive(Debug)]
@@ -332,7 +333,7 @@ async fn run_session(
             _ = ping_interval.tick() => {
                 if last_pong.elapsed() >= PONG_TIMEOUT {
                     tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
-                    close_socket_best_effort(api, index, socket_id).await;
+                    spawn_socket_close(api, index, socket_id);
                     return Err(DmdataError::Ws("pong not received within 60s".into()));
                 }
                 ping_seq += 1;
@@ -352,7 +353,7 @@ async fn run_session(
         .unwrap_or(false))
 }
 
-async fn close_socket_best_effort(api: &DmdataApi, index: usize, socket_id: Option<i64>) {
+fn spawn_socket_close(api: &DmdataApi, index: usize, socket_id: Option<i64>) {
     let Some(socket_id) = socket_id else {
         tracing::warn!(
             conn = index,
@@ -360,19 +361,23 @@ async fn close_socket_best_effort(api: &DmdataApi, index: usize, socket_id: Opti
         );
         return;
     };
-    match api.socket_close(socket_id).await {
-        Ok(()) => tracing::info!(
-            conn = index,
-            socket_id,
-            "closed dmdata socket after watchdog timeout"
-        ),
-        Err(e) => tracing::warn!(
-            conn = index,
-            socket_id,
-            error = %e,
-            "failed to close dmdata socket after watchdog timeout"
-        ),
-    }
+    let api = api.clone();
+    tokio::spawn(async move {
+        match tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, api.socket_close(socket_id)).await {
+            Ok(Ok(())) => tracing::info!(
+                conn = index,
+                socket_id,
+                "closed dmdata socket after watchdog timeout"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                conn = index,
+                socket_id,
+                error = %e,
+                "failed to close dmdata socket after watchdog timeout"
+            ),
+            Err(_) => tracing::warn!(conn = index, socket_id, "dmdata socket close timed out"),
+        }
+    });
 }
 
 #[cfg(test)]
