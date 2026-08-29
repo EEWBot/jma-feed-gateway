@@ -19,6 +19,8 @@ use crate::state::SharedState;
 use crate::supervisor::TaskExit;
 use crate::types::{DedupKey, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 受信メッセージ1件に対して呼び出し側が行うべきアクション(純粋関数の出力)。
 #[derive(Debug)]
 pub enum WsAction {
@@ -258,8 +260,9 @@ async fn run_session(
     let start = api.socket_start(&request).await?;
     let url = format!("{endpoint}?ticket={}", start.ticket);
 
-    let (ws, _) = connect_async(url.as_str())
+    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
         .await
+        .map_err(|_| DmdataError::Ws("connect timed out after 30s".into()))?
         .map_err(|e| DmdataError::Ws(format!("connect failed: {e}")))?;
     tracing::info!(conn = index, endpoint, "ws connected");
 
