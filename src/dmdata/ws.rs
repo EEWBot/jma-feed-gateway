@@ -29,7 +29,7 @@ pub enum WsAction {
     /// 何もしない(pong受信、パース不能等)。
     None,
     /// startメッセージ受信。readiness を接続済みにする。
-    Started,
+    Started { socket_id: Option<i64> },
     /// テキストを返信する(DMDATAのJSON pingへのpong応答)。
     Reply(String),
     /// pong受信。watchdogの生存タイマをリセットする。
@@ -52,7 +52,9 @@ pub fn handle_ws_message(text: &str, conn_index: usize) -> WsAction {
     match message {
         WsMessage::Start(start) => {
             tracing::info!(conn = conn_index, app_name = ?start.app_name, socket_id = ?start.socket_id, "ws start received");
-            WsAction::Started
+            WsAction::Started {
+                socket_id: start.socket_id,
+            }
         }
         WsMessage::Ping(ping) => {
             // DMDATAのJSON pingにはJSONで応答する(WSプロトコルpingとは別物)
@@ -264,6 +266,7 @@ async fn run_session(
         app_name.to_string(),
     );
     let start = api.socket_start(&request).await?;
+    let mut socket_id = start.websocket.as_ref().map(|ws| ws.id);
     let url = format!("{endpoint}?ticket={}", start.ticket);
 
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
@@ -292,7 +295,10 @@ async fn run_session(
                 match message {
                     Message::Text(text) => match handle_ws_message(text.as_str(), index) {
                         WsAction::None => {}
-                        WsAction::Started => {
+                        WsAction::Started { socket_id: id } => {
+                            if id.is_some() {
+                                socket_id = id;
+                            }
                             // start受信=購読確立。全断エピソード後ならcatch-up pollが通知される
                             state.readiness.mark_ws_connected(index);
                         }
@@ -326,6 +332,7 @@ async fn run_session(
             _ = ping_interval.tick() => {
                 if last_pong.elapsed() >= PONG_TIMEOUT {
                     tracing::warn!(conn = index, "pong watchdog timed out; dropping session");
+                    close_socket_best_effort(api, index, socket_id).await;
                     return Err(DmdataError::Ws("pong not received within 60s".into()));
                 }
                 ping_seq += 1;
@@ -345,6 +352,29 @@ async fn run_session(
         .unwrap_or(false))
 }
 
+async fn close_socket_best_effort(api: &DmdataApi, index: usize, socket_id: Option<i64>) {
+    let Some(socket_id) = socket_id else {
+        tracing::warn!(
+            conn = index,
+            "socket id unknown; skipping dmdata socket close"
+        );
+        return;
+    };
+    match api.socket_close(socket_id).await {
+        Ok(()) => tracing::info!(
+            conn = index,
+            socket_id,
+            "closed dmdata socket after watchdog timeout"
+        ),
+        Err(e) => tracing::warn!(
+            conn = index,
+            socket_id,
+            error = %e,
+            "failed to close dmdata socket after watchdog timeout"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,11 +385,11 @@ mod tests {
     const ERROR_JSON: &str = include_str!("../../tests/fixtures/ws_error.json");
 
     #[test]
-    fn start_returns_started() {
-        assert!(matches!(
-            handle_ws_message(START_JSON, 0),
-            WsAction::Started
-        ));
+    fn start_returns_started_with_socket_id() {
+        let WsAction::Started { socket_id } = handle_ws_message(START_JSON, 0) else {
+            panic!("expected started");
+        };
+        assert_eq!(socket_id, Some(12345));
     }
 
     #[test]
