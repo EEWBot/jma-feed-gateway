@@ -1,4 +1,4 @@
-//! 起動シーケンス: 設定 → HTTPクライアント → 初期一覧 → Aggregator → WS×2 → Poller → HTTPサーバ。
+//! 起動シーケンス: 設定 → HTTPクライアント → 初期一覧 → /latest補完 → Aggregator → WS×2 → Poller → HTTPサーバ。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -78,6 +78,18 @@ async fn run() -> Result<(), AppError> {
         state.deduper.insert(DedupKey::TelegramId(meta.id.clone()));
         state.feed_ids.insert(meta.id.clone());
     }
+
+    // /latest の初期値(初期一覧に対象種別が無ければ telegram.list で補完)。
+    // aggregator起動前にseedし、aggregatorがこれに初期一覧を重ねる。
+    // 補完した電文は既出扱いでdedupへseedする(pollが古い電文をfeedへ再publishしないように)。
+    // feed_ids には入れない — feed外の電文で、実体は /latest 経由でのみ遅延取得される
+    let latest = fetcher::load_initial_latest(&state.dmdata_api, &config, &initial_metas).await;
+    for entry in [&latest.earthquake, &latest.tsunami].into_iter().flatten() {
+        state
+            .deduper
+            .insert(DedupKey::TelegramId(entry.meta.id.clone()));
+    }
+    state.latest.store(Arc::new(latest));
 
     let shutdown = Shutdown::new();
 

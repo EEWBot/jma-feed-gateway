@@ -53,11 +53,16 @@ impl LatestEntries {
     /// 初期一覧(updated降順)から各種別の先頭一致を最新とする。実体は未取得(None)。
     pub fn from_metas(metas: &[ItemMeta]) -> Self {
         let mut latest = Self::default();
+        latest.offer_metas(metas);
+        latest
+    }
+
+    /// 一覧(updated降順)の各電文を実体なしで offer する。
+    pub fn offer_metas(&mut self, metas: &[ItemMeta]) {
         // 古い順に offer すれば先頭一致が最後に勝つ(同一updatedも先頭優先になる)
         for meta in metas.iter().rev() {
-            latest.offer(meta, None);
+            self.offer(meta, None);
         }
-        latest
     }
 
     /// 対象種別で、保持中の電文以上に新しければ差し替える。差し替えたら true。

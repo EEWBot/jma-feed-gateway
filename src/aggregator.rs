@@ -21,8 +21,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
 
     let mut metas: VecDeque<ItemMeta> = initial_metas.into_iter().take(capacity).collect();
     // /latest の保管場所。feedとは独立に保持する(押し出されても新着が来るまで残る)。
-    // 初期一覧由来は実体未取得のため、初回アクセス時にCacheFill経路で埋まる
-    let mut latest = LatestEntries::from_metas(metas.make_contiguous());
+    // 起動時に state.latest へseed済みの値(初期一覧に無い種別の補完)に初期一覧を重ねる。
+    // 初期一覧由来・補完由来とも実体未取得のため、初回アクセス時にCacheFill経路で埋まる
+    let mut latest = LatestEntries::clone(&state.latest.load());
+    latest.offer_metas(metas.make_contiguous());
     state.latest.store(Arc::new(latest.clone()));
     publish(&state, &mut metas, &base_url);
 
