@@ -133,7 +133,14 @@ pub async fn data(
     if id.is_empty() {
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
-    serve_entity(&state, id, &headers, DATA_CACHE_CONTROL, false).await
+    serve_entity(
+        &state,
+        id,
+        &headers,
+        DATA_CACHE_CONTROL,
+        MissPolicy::FeedOnly,
+    )
+    .await
 }
 
 /// GET /latest/earthquake — 最新の VXSE51 / VXSE52 / VXSE53 の実体XML。
@@ -159,24 +166,54 @@ async fn serve_latest(
         Some(LatestEntry {
             entry: Some(entry), ..
         }) => serve_cached(headers, &entry, LATEST_CACHE_CONTROL),
-        // 実体未取得(poll由来・ウォームアップ由来): dataハンドラと同じ経路で取得する。
-        // IDはaggregatorが決めたものなので、feedから押し出された後でも取得を許可する
+        // 実体未取得(poll由来・ウォームアップ由来・起動時補完): dataハンドラと同じ経路で取得する
         Some(LatestEntry { meta, entry: None }) => {
-            serve_entity(state, &meta.id, headers, LATEST_CACHE_CONTROL, true).await
+            serve_entity(
+                state,
+                &meta.id,
+                headers,
+                LATEST_CACHE_CONTROL,
+                MissPolicy::Latest,
+            )
+            .await
         }
         None => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response(),
     }
 }
 
-/// 電文IDの実体XMLを返す。pinned → entities → (feed在中なら)dmdataからsingleflight取得。
-/// `allow_outside_feed` はfeed外IDのアウトバウンドfetchを許可する(サーバ側で決めたIDのみ。
-/// クライアント入力のIDには使わない)。
+/// キャッシュミス時に上流取得を許可する条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissPolicy {
+    /// クライアント指定のID(dataハンドラ)。feed在中IDのみ取得し、それ以外は404。
+    FeedOnly,
+    /// `/latest` が保持するID。サーバ側(aggregator)が決めたIDなのでfeed外でも取得を許可する。
+    Latest,
+}
+
+/// 上流取得の失敗(dmdataのエラー応答・通信失敗)。
+/// 取得を許可した時点で電文は存在するはずなので、404ではなく上流障害として返す。
+fn upstream_failed() -> Response {
+    (StatusCode::BAD_GATEWAY, [(header::CACHE_CONTROL, NO_STORE)]).into_response()
+}
+
+/// 上流取得の待機予算切れ。
+fn upstream_timed_out() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        [(header::CACHE_CONTROL, NO_STORE)],
+    )
+        .into_response()
+}
+
+/// 電文IDの実体XMLを返す。pinned → entities → (取得許可されていれば)dmdataから
+/// singleflight取得。ミス時の許可条件は `policy` で決まり、許可したうえでの取得失敗は
+/// 502、待機予算切れは504を返す。
 async fn serve_entity(
     state: &SharedState,
     id: &str,
     headers: &HeaderMap,
     cache_control: HeaderValue,
-    allow_outside_feed: bool,
+    policy: MissPolicy,
 ) -> Response {
     // 1. pinned(feed在中のdmdata由来entry)。DashMapのRef guardを
     //    .await 跨ぎで持たないよう Arc clone して即drop
@@ -192,13 +229,19 @@ async fn serve_entity(
 
     // 3. ミス: 電文IDとしてありうる形式のみ dmdata telegram.data から取得する。
     //    ゴミIDで dmdata API 呼び出しを浪費しない(inflight も起動しない)。
+    //    /latest のIDはdmdata由来なので通常ここには来ない(来たら取得不能=上流障害扱い)
     if !is_fetchable_id(id) {
-        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
+        return match policy {
+            MissPolicy::FeedOnly => {
+                (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response()
+            }
+            MissPolicy::Latest => upstream_failed(),
+        };
     }
 
-    // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可。
+    // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可(/latest は対象外)。
     //    (evict済みでもキャッシュ在中ならステップ1-2で配信済み)
-    if !allow_outside_feed && !state.feed_ids.contains(id) {
+    if policy == MissPolicy::FeedOnly && !state.feed_ids.contains(id) {
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
 
@@ -226,16 +269,16 @@ async fn serve_entity(
 
     // 待機予算 = クライアント全体タイムアウト + 余裕1秒(fetchはこれを超えられない)
     let wait = Duration::from_secs(state.config.dmdata.fetch_timeout_secs + 1);
-    let entry = match tokio::time::timeout(wait, rx.wait_for(|v| v.is_some())).await {
-        Ok(Ok(value)) => value.as_ref().cloned(),
-        // タイムアウト or Sender drop(取得失敗)
-        _ => None,
-    };
-    match entry {
-        Some(entry) => serve_cached(headers, &entry, cache_control),
-        // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
-        // ならないため404を返す(旧JMA上流への307は廃止)
-        None => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response(),
+    // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
+    // ならないため(旧JMA上流への307は廃止)、上流障害として502/504を返す
+    match tokio::time::timeout(wait, rx.wait_for(|v| v.is_some())).await {
+        Ok(Ok(value)) => match value.as_ref() {
+            Some(entry) => serve_cached(headers, entry, cache_control),
+            None => upstream_failed(),
+        },
+        // Sender drop(取得失敗)
+        Ok(Err(_)) => upstream_failed(),
+        Err(_) => upstream_timed_out(),
     }
 }
 

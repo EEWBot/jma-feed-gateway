@@ -477,9 +477,10 @@ async fn singleflight_hits_upstream_once() {
 }
 
 #[tokio::test]
-async fn data_miss_upstream_error_returns_404() {
-    // 上流が5xxで取得失敗(Sender drop)した場合は404(dmdata data APIは
-    // 認証必須でリダイレクト先にならないため、旧JMA上流への307は廃止)
+async fn data_miss_upstream_error_returns_502() {
+    // feed在中IDの取得が上流5xxで失敗(Sender drop)した場合は502(電文は存在するはず
+    // なので404にしない。dmdata data APIは認証必須でリダイレクト先にならないため、
+    // 旧JMA上流への307は廃止)
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -499,17 +500,18 @@ async fn data_miss_upstream_error_returns_404() {
     let router = build_router(state.clone());
 
     let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
     assert!(
         response.headers().get(header::LOCATION).is_none(),
-        "404 must not carry Location"
+        "502 must not carry Location"
     );
     wait_inflight_empty(&state).await;
 }
 
 #[tokio::test]
-async fn data_miss_fetch_timeout_returns_404() {
-    // 上流応答が待機予算(fetch_timeout_secs + 1秒)を超える場合も404
+async fn data_miss_fetch_timeout_returns_504() {
+    // feed在中IDの上流応答が待機予算(fetch_timeout_secs + 1秒)を超える場合は504
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -535,10 +537,11 @@ async fn data_miss_fetch_timeout_returns_404() {
     let router = build_router(state.clone());
 
     let response = get(&router, &format!("/developer/xml/data/{MISS_ID}.xml"), None).await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
     assert!(
         response.headers().get(header::LOCATION).is_none(),
-        "404 must not carry Location"
+        "504 must not carry Location"
     );
 }
 
@@ -926,4 +929,76 @@ async fn latest_without_entry_fetches_even_outside_feed() {
     );
     wait_inflight_empty(&state).await;
     // MockServer drop 時に expect(1) が検証される
+}
+
+/// `/latest/earthquake` が実体未取得の `MISS_ID` を指す状態を作る(feed外)。
+fn store_latest_without_entry(state: &SharedState) {
+    state.latest.store(Arc::new(LatestEntries {
+        earthquake: Some(LatestEntry {
+            meta: ItemMeta {
+                id: MISS_ID.into(),
+                telegram_type: "VXSE53".into(),
+                ..ItemMeta::default()
+            },
+            entry: None,
+        }),
+        tsunami: None,
+    }));
+}
+
+#[tokio::test]
+async fn latest_upstream_error_returns_502() {
+    // IDを持っているのに取得できない = 上流障害。dataハンドラと違い404にしない
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{MISS_ID}")))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.dmdata.data_api_base = mock_server.uri();
+    });
+    std::mem::forget(rx);
+    store_latest_without_entry(&state);
+    let router = build_router(state.clone());
+
+    let response = get(&router, "/latest/earthquake", None).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
+    wait_inflight_empty(&state).await;
+}
+
+#[tokio::test]
+async fn latest_fetch_timeout_returns_504() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{MISS_ID}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<Report>too late</Report>", "application/xml")
+                // 待機予算(0 + 1秒)を確実に超える遅延
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.dmdata.data_api_base = mock_server.uri();
+        c.dmdata.fetch_timeout_secs = 0;
+    });
+    std::mem::forget(rx);
+    store_latest_without_entry(&state);
+    let router = build_router(state.clone());
+
+    let response = get(&router, "/latest/earthquake", None).await;
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
 }
