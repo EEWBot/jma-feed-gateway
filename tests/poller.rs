@@ -418,6 +418,7 @@ async fn poll_skips_id_already_delivered_via_ws() {
         updated: "2026-07-05T04:11:00+09:00".into(),
         author: "気象庁".into(),
         content: "本文".into(),
+        telegram_type: String::new(),
     };
     state
         .event_tx

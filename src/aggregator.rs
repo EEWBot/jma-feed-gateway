@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 
 use crate::jma::feed_render;
 use crate::state::SharedState;
-use crate::types::{DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta};
+use crate::types::{
+    DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta, LatestEntries,
+};
 
 /// Aggregatorタスク本体。`initial_metas` は起動時の初期一覧(新しい順)。
 pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, state: SharedState) {
@@ -18,6 +20,10 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
     let base_url = state.config.http.public_base_url.clone();
 
     let mut metas: VecDeque<ItemMeta> = initial_metas.into_iter().take(capacity).collect();
+    // /latest の保管場所。feedとは独立に保持する(押し出されても新着が来るまで残る)。
+    // 初期一覧由来は実体未取得のため、初回アクセス時にCacheFill経路で埋まる
+    let mut latest = LatestEntries::from_metas(metas.make_contiguous());
+    state.latest.store(Arc::new(latest.clone()));
     publish(&state, &mut metas, &base_url);
 
     state
@@ -46,6 +52,11 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
         if event.source == EventSource::CacheFill {
             // 不変条件: CacheFillのEventはfetch_entityが常に実体を載せる
             let entry = entry.expect("cache fill event must carry a body");
+            // /latest が実体未取得で指している電文なら保管場所も埋める
+            // (feedから押し出された後でも配信できるように)
+            if latest.fill(&event.meta.id, &entry) {
+                state.latest.store(Arc::new(latest.clone()));
+            }
             if metas.iter().any(|m| m.id == event.meta.id) {
                 // or_insert: WS/poll経路で先に新しいbodyがpin済みなら上書きしない
                 state.pinned.entry(event.meta.id.clone()).or_insert(entry);
@@ -68,6 +79,12 @@ pub async fn run(initial_metas: Vec<ItemMeta>, mut rx: mpsc::Receiver<Event>, st
                 continue;
             }
             metas.remove(pos);
+        }
+
+        // 対象種別の新着なら /latest を差し替える(publishより前 — feedに載った時点で
+        // /latest からも引けるように)。poll由来は実体なしで載り、CacheFillで埋まる
+        if latest.offer(&event.meta, entry.as_ref()) {
+            state.latest.store(Arc::new(latest.clone()));
         }
 
         // 実体を持つWS由来はpinnedへ(publishより前 — feedが参照する時点で必ずピン済み)。

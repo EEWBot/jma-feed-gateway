@@ -22,6 +22,7 @@ fn meta(id: &str, title: &str, updated: &str) -> ItemMeta {
         updated: updated.into(),
         author: "気象庁".into(),
         content: format!("{title} の本文"),
+        telegram_type: String::new(),
     }
 }
 
@@ -869,4 +870,166 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
             .and_then(|v| v.to_str().ok()),
         Some("Sat, 04 Jul 2026 19:20:00 GMT")
     );
+}
+
+#[tokio::test]
+async fn latest_tracks_newest_earthquake_and_tsunami() {
+    let typed = |id: &str, telegram_type: &str, updated: &str| ItemMeta {
+        telegram_type: telegram_type.into(),
+        ..meta(id, telegram_type, updated)
+    };
+    let latest_id = |state: &SharedState, tsunami: bool| {
+        let latest = state.latest.load();
+        let slot = if tsunami {
+            &latest.tsunami
+        } else {
+            &latest.earthquake
+        };
+        slot.as_ref().map(|l| l.meta.id.clone())
+    };
+    // 初期一覧(新しい順)から算出される(実体は未取得)
+    let (state, tx) = setup(
+        10,
+        vec![
+            typed("id-vxse61", "VXSE61", "2026-07-05T04:20:00+09:00"),
+            typed("id-vxse52", "VXSE52", "2026-07-05T04:10:00+09:00"),
+        ],
+    )
+    .await;
+    assert_eq!(latest_id(&state, false).as_deref(), Some("id-vxse52"));
+    assert!(
+        state
+            .latest
+            .load()
+            .earthquake
+            .as_ref()
+            .unwrap()
+            .entry
+            .is_none()
+    );
+    assert!(latest_id(&state, true).is_none());
+
+    let etag0 = state.feed.load_full().etag.clone();
+    tx.send(dmdata_event(
+        "t-tsunami",
+        typed("id-vtse41", "VTSE41", "2026-07-05T04:15:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    assert_eq!(latest_id(&state, true).as_deref(), Some("id-vtse41"));
+    // WS由来は実体付きで保管される
+    let tsunami = state.latest.load().tsunami.clone().unwrap();
+    assert_eq!(
+        &tsunami.entry.expect("ws entry must carry body").body[..],
+        b"<Report>id-vtse41</Report>"
+    );
+
+    // updatedが古い電文(遅延publish)では差し替わらない
+    let etag1 = state.feed.load_full().etag.clone();
+    tx.send(dmdata_event(
+        "t-old",
+        typed("id-vxse51-old", "VXSE51", "2026-07-05T04:00:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag1).await;
+    assert_eq!(latest_id(&state, false).as_deref(), Some("id-vxse52"));
+
+    let etag2 = state.feed.load_full().etag.clone();
+    tx.send(dmdata_event(
+        "t-new",
+        typed("id-vxse53", "VXSE53", "2026-07-05T04:30:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag2).await;
+    assert_eq!(latest_id(&state, false).as_deref(), Some("id-vxse53"));
+}
+
+#[tokio::test]
+async fn latest_survives_eviction_from_feed() {
+    let typed = |id: &str, telegram_type: &str, updated: &str| ItemMeta {
+        telegram_type: telegram_type.into(),
+        ..meta(id, telegram_type, updated)
+    };
+    let (state, tx) = setup(1, Vec::new()).await;
+
+    let etag0 = state.feed.load_full().etag.clone();
+    tx.send(dmdata_event(
+        "t-tsunami",
+        typed("id-vtse41", "VTSE41", "2026-07-05T04:10:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+
+    // feed_entries=1 なので次の電文で津波電文はfeedから押し出される
+    let etag1 = state.feed.load_full().etag.clone();
+    tx.send(dmdata_event(
+        "t-other",
+        typed("id-vxse61", "VXSE61", "2026-07-05T04:20:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &etag1).await;
+    assert!(!body.contains("id-vtse41"), "premise: evicted from feed");
+    assert!(!state.feed_ids.contains("id-vtse41"));
+    assert!(state.pinned.get("id-vtse41").is_none());
+
+    // 押し出されても保管場所には実体付きで残る(mokaのTTLとは無関係)
+    let tsunami = state.latest.load().tsunami.clone().expect("must be kept");
+    assert_eq!(tsunami.meta.id, "id-vtse41");
+    assert_eq!(
+        &tsunami.entry.expect("entry must be kept").body[..],
+        b"<Report>id-vtse41</Report>"
+    );
+}
+
+#[tokio::test]
+async fn cache_fill_fills_latest_without_entry() {
+    // ウォームアップ由来(実体未取得)の最新電文は、CacheFillで保管場所が埋まる
+    let initial = ItemMeta {
+        telegram_type: "VTSE41".into(),
+        ..meta(
+            "id-vtse41",
+            "津波警報・注意報・予報a",
+            "2026-07-05T04:10:00+09:00",
+        )
+    };
+    let (state, tx) = setup(10, vec![initial.clone()]).await;
+    assert!(
+        state
+            .latest
+            .load()
+            .tsunami
+            .as_ref()
+            .unwrap()
+            .entry
+            .is_none()
+    );
+
+    // CacheFill由来のmetaは電文種別を持たない(IDで照合される)
+    let fill_meta = ItemMeta {
+        telegram_type: String::new(),
+        ..initial
+    };
+    tx.send(cache_fill_event(fill_meta, b"<Report>filled</Report>"))
+        .await
+        .unwrap();
+
+    for _ in 0..100 {
+        if let Some(entry) = state
+            .latest
+            .load()
+            .tsunami
+            .as_ref()
+            .and_then(|l| l.entry.clone())
+        {
+            assert_eq!(&entry.body[..], b"<Report>filled</Report>");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("latest entry was not filled by cache fill");
 }

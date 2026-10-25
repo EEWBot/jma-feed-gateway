@@ -18,7 +18,9 @@ use jma_feed_gateway::config::{Config, DEFAULT_CONFIG_TOML};
 use jma_feed_gateway::dmdata::api::DmdataApi;
 use jma_feed_gateway::http::build_router;
 use jma_feed_gateway::state::{AppState, SharedState};
-use jma_feed_gateway::types::{EntityEntry, Event, FeedSnapshot, ItemMeta};
+use jma_feed_gateway::types::{
+    EntityEntry, Event, FeedSnapshot, ItemMeta, LatestEntries, LatestEntry,
+};
 use tokio::sync::mpsc;
 
 const FEED_PATH: &str = "/developer/xml/feed/eqvol.xml";
@@ -802,4 +804,126 @@ async fn feed_garbage_if_modified_since_returns_200() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn latest_returns_404_when_no_matching_telegram() {
+    let (_state, router) = setup().await;
+
+    for uri in ["/latest/earthquake", "/latest/tsunami"] {
+        let response = get(&router, uri, None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
+    }
+}
+
+#[tokio::test]
+async fn latest_earthquake_serves_stored_entity_with_revalidation() {
+    let (state, router) = setup().await;
+    let meta = ItemMeta {
+        id: "TELEGRAM_ID_EQ".into(),
+        telegram_type: "VXSE53".into(),
+        ..ItemMeta::default()
+    };
+    // 保管場所のみに存在(pinned / entities / feed_ids には無い)
+    let entry = EntityEntry::new(Bytes::from_static(b"<Report>VXSE53</Report>"), meta.clone());
+    state.latest.store(Arc::new(LatestEntries {
+        earthquake: Some(LatestEntry {
+            meta,
+            entry: Some(Arc::new(entry)),
+        }),
+        tsunami: None,
+    }));
+
+    let response = get(&router, "/latest/earthquake", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, "content-type"),
+        Some("application/xml; charset=utf-8")
+    );
+    // 中身が差し替わるURLなので immutable ではなく毎回再検証
+    assert_eq!(
+        header_str(&response, "cache-control"),
+        Some("public, no-cache, must-revalidate")
+    );
+    let etag = header_str(&response, "etag")
+        .expect("ETag must be present")
+        .to_owned();
+    assert_eq!(&body_bytes(response).await[..], b"<Report>VXSE53</Report>");
+
+    let response = get(&router, "/latest/earthquake", Some(&etag)).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(body_bytes(response).await.is_empty());
+
+    // 津波側は未設定のまま404
+    let response = get(&router, "/latest/tsunami", None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn latest_without_entry_serves_cached_entity() {
+    let (state, router) = setup().await;
+    state.latest.store(Arc::new(LatestEntries {
+        earthquake: None,
+        tsunami: Some(LatestEntry {
+            meta: ItemMeta {
+                id: UUID_A.into(),
+                telegram_type: "VTSE41".into(),
+                ..ItemMeta::default()
+            },
+            entry: None,
+        }),
+    }));
+
+    let response = get(&router, "/latest/tsunami", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &body_bytes(response).await[..],
+        b"<Report>cached entity</Report>"
+    );
+}
+
+#[tokio::test]
+async fn latest_without_entry_fetches_even_outside_feed() {
+    // 実体未取得のままfeedから押し出された最新電文も、アローリストを通さず取得できる
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{MISS_ID}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<Report>latest fetched</Report>", "application/xml"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (state, rx) = make_state(test_config(), |c| {
+        c.dmdata.data_api_base = mock_server.uri();
+    });
+    std::mem::forget(rx);
+    // feed_ids は seed しない = feed外ID
+    state.latest.store(Arc::new(LatestEntries {
+        earthquake: Some(LatestEntry {
+            meta: ItemMeta {
+                id: MISS_ID.into(),
+                telegram_type: "VXSE53".into(),
+                ..ItemMeta::default()
+            },
+            entry: None,
+        }),
+        tsunami: None,
+    }));
+    let router = build_router(state.clone());
+
+    let response = get(&router, "/latest/earthquake", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &body_bytes(response).await[..],
+        b"<Report>latest fetched</Report>"
+    );
+    wait_inflight_empty(&state).await;
+    // MockServer drop 時に expect(1) が検証される
 }

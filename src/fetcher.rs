@@ -154,6 +154,7 @@ pub(crate) fn select_item(item: &TelegramListItem, types: &[String]) -> Option<I
         updated,
         author: control.publishing_office.unwrap_or_default(),
         content: xml_head.headline.unwrap_or_default(),
+        telegram_type: item.head.telegram_type.clone(),
     })
 }
 
@@ -204,6 +205,9 @@ pub async fn fetch_entity(state: SharedState, id: String, result_tx: InflightTx)
         updated: entity_meta.report_date_time,
         author: entity_meta.publishing_office,
         content: entity_meta.headline_text,
+        // 実体XMLは電文種別コードを持たない。CacheFillは一覧(metas)を更新しないため
+        // /latest の判定には影響しない
+        telegram_type: String::new(),
     };
 
     // 待機中のハンドラへ完成entryを即配布する(Bytes cloneは安価)。
@@ -286,6 +290,7 @@ mod tests {
         assert_eq!(meta.updated, "2026-07-08T10:00:00+09:00");
         assert_eq!(meta.author, "気象庁本庁");
         assert_eq!(meta.content, "地震がありました。");
+        assert_eq!(meta.telegram_type, "VXSE53");
     }
 
     #[test]

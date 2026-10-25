@@ -14,7 +14,7 @@ use crate::fetcher;
 use crate::http::etag;
 use crate::jma::id::is_fetchable_id;
 use crate::state::SharedState;
-use crate::types::EntityEntry;
+use crate::types::{EntityEntry, LatestEntry};
 
 const ATOM_CONTENT_TYPE: HeaderValue =
     HeaderValue::from_static("application/atom+xml; charset=utf-8");
@@ -31,11 +31,13 @@ const DATA_CACHE_CONTROL: HeaderValue =
 // no-cacheの解釈が緩い中間キャッシュ実装への防御として併記しておく。
 const FEED_CACHE_CONTROL: HeaderValue =
     HeaderValue::from_static("public, no-cache, must-revalidate");
+// /latest/* は同一URLの中身が新着で差し替わるため、フィードと同じく毎回再検証させる
+const LATEST_CACHE_CONTROL: HeaderValue = FEED_CACHE_CONTROL;
 // エラー応答・ヘルスチェックはCDN/ブラウザにキャッシュさせない
 const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 
 /// If-None-Match を評価して 200(body) か 304(bodyなし+ETag再送)を返す。
-fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderValue) -> Response {
+fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, cache_control: HeaderValue) -> Response {
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -46,7 +48,7 @@ fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderVa
             StatusCode::NOT_MODIFIED,
             [
                 (header::ETAG, entry.etag_header.clone()),
-                (header::CACHE_CONTROL, DATA_CACHE_CONTROL),
+                (header::CACHE_CONTROL, cache_control),
             ],
         )
             .into_response();
@@ -55,8 +57,8 @@ fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, content_type: HeaderVa
         StatusCode::OK,
         [
             (header::ETAG, entry.etag_header.clone()),
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, DATA_CACHE_CONTROL),
+            (header::CONTENT_TYPE, XML_CONTENT_TYPE),
+            (header::CACHE_CONTROL, cache_control),
         ],
         entry.body.clone(),
     )
@@ -131,17 +133,61 @@ pub async fn data(
     if id.is_empty() {
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
+    serve_entity(&state, id, &headers, DATA_CACHE_CONTROL, false).await
+}
 
+/// GET /latest/earthquake — 最新の VXSE51 / VXSE52 / VXSE53 の実体XML。
+pub async fn latest_earthquake(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let latest = state.latest.load().earthquake.clone();
+    serve_latest(&state, latest, &headers).await
+}
+
+/// GET /latest/tsunami — 最新の VTSE41 の実体XML。
+pub async fn latest_tsunami(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let latest = state.latest.load().tsunami.clone();
+    serve_latest(&state, latest, &headers).await
+}
+
+/// `/latest/*` 共通。保管場所が空なら404。
+/// 同じURLの中身が新着で差し替わるため、immutable ではなくフィードと同じ毎回再検証にする。
+async fn serve_latest(
+    state: &SharedState,
+    latest: Option<LatestEntry>,
+    headers: &HeaderMap,
+) -> Response {
+    match latest {
+        Some(LatestEntry {
+            entry: Some(entry), ..
+        }) => serve_cached(headers, &entry, LATEST_CACHE_CONTROL),
+        // 実体未取得(poll由来・ウォームアップ由来): dataハンドラと同じ経路で取得する。
+        // IDはaggregatorが決めたものなので、feedから押し出された後でも取得を許可する
+        Some(LatestEntry { meta, entry: None }) => {
+            serve_entity(state, &meta.id, headers, LATEST_CACHE_CONTROL, true).await
+        }
+        None => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response(),
+    }
+}
+
+/// 電文IDの実体XMLを返す。pinned → entities → (feed在中なら)dmdataからsingleflight取得。
+/// `allow_outside_feed` はfeed外IDのアウトバウンドfetchを許可する(サーバ側で決めたIDのみ。
+/// クライアント入力のIDには使わない)。
+async fn serve_entity(
+    state: &SharedState,
+    id: &str,
+    headers: &HeaderMap,
+    cache_control: HeaderValue,
+    allow_outside_feed: bool,
+) -> Response {
     // 1. pinned(feed在中のdmdata由来entry)。DashMapのRef guardを
     //    .await 跨ぎで持たないよう Arc clone して即drop
     let pinned = state.pinned.get(id).map(|entry| Arc::clone(entry.value()));
     if let Some(entry) = pinned {
-        return serve_cached(&headers, &entry, XML_CONTENT_TYPE);
+        return serve_cached(headers, &entry, cache_control);
     }
 
     // 2. entities(moka: ミス補充された実体 + feedから降格したdmdata entry)
     if let Some(entry) = state.entities.get(id).await {
-        return serve_cached(&headers, &entry, XML_CONTENT_TYPE);
+        return serve_cached(headers, &entry, cache_control);
     }
 
     // 3. ミス: 電文IDとしてありうる形式のみ dmdata telegram.data から取得する。
@@ -152,7 +198,7 @@ pub async fn data(
 
     // 4. アローリスト: feed在中IDのみアウトバウンドfetchを許可。
     //    (evict済みでもキャッシュ在中ならステップ1-2で配信済み)
-    if !state.feed_ids.contains(id) {
+    if !allow_outside_feed && !state.feed_ids.contains(id) {
         return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response();
     }
 
@@ -186,7 +232,7 @@ pub async fn data(
         _ => None,
     };
     match entry {
-        Some(entry) => serve_cached(&headers, &entry, XML_CONTENT_TYPE),
+        Some(entry) => serve_cached(headers, &entry, cache_control),
         // 取得失敗・タイムアウト: dmdata telegram.data は認証必須でリダイレクト先に
         // ならないため404を返す(旧JMA上流への307は廃止)
         None => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, NO_STORE)]).into_response(),
