@@ -12,7 +12,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::config::Config;
 use crate::dmdata::api::DmdataApi;
-use crate::types::{DedupKey, EntityEntry, Event, FeedSnapshot};
+use crate::types::{DedupKey, EntityEntry, Event, FeedSnapshot, LatestEntries};
 
 /// キャッシュミス待機者へ完成entryを配るwatch。None=取得中、Some=完成。
 /// Sender drop(None のまま)=取得失敗のシグナル。
@@ -251,6 +251,9 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// 完成済みAtomフィード。更新は aggregator のみ。
     pub feed: ArcSwap<FeedSnapshot>,
+    /// `/latest/*` が返す種別ごとの最新電文。更新は aggregator のみ。
+    /// feedとは独立に保持し、feedから押し出されても新しい電文が来るまで残る。
+    pub latest: ArcSwap<LatestEntries>,
     /// 実体XMLキャッシュ。value は Clone 必須のため `Arc<EntityEntry>`。
     pub entities: moka::future::Cache<String, Arc<EntityEntry>>,
     /// DMDATA由来でフィード在中のentry本体。aggregatorのみ書き込み。
@@ -310,6 +313,7 @@ impl AppState {
         Self {
             config,
             feed: ArcSwap::from_pointee(FeedSnapshot::empty()),
+            latest: ArcSwap::from_pointee(LatestEntries::default()),
             entities,
             pinned: DashMap::new(),
             inflight: DashMap::new(),

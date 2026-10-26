@@ -240,6 +240,7 @@ fn build_event(data: WsData, conn_index: usize) -> Result<Option<Event>, DmdataE
         updated: updated.clone(),
         author,
         content,
+        telegram_type,
     };
 
     // dedupはDMDATA電文一意ID。空IDは前段でガード済み。
@@ -841,6 +842,7 @@ mod tests {
                 updated: String::new(),
                 author: String::new(),
                 content: String::new(),
+                telegram_type: String::new(),
             },
         }
     }

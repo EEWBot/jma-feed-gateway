@@ -9,13 +9,19 @@ use crate::dmdata::api::{DmdataApi, TelegramListItem, TelegramListResponse};
 use crate::error::DmdataError;
 use crate::jma::entity_parse;
 use crate::state::{InflightTx, SharedState};
-use crate::types::{DedupKey, EntityEntry, Event, EventSource, ItemMeta, normalize_rfc3339_to_jst};
+use crate::types::{
+    DedupKey, EntityEntry, Event, EventSource, ItemMeta, LATEST_EARTHQUAKE_TYPES,
+    LATEST_TSUNAMI_TYPES, LatestEntries, normalize_rfc3339_to_jst,
+};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// ウォームアップで辿る最大ページ数(安全弁)。
 const MAX_WARMUP_PAGES: usize = 10;
 /// telegram.list の1ページあたり取得件数(APIの上限値)。poller も共有する。
 pub(crate) const LIST_PAGE_LIMIT: usize = 100;
+/// `/latest` 補完で telegram.list(type絞り込み)から取得する件数。
+/// テスト電文・非XMLのskipや訂正報の前後を吸収できれば十分。
+const LATEST_FALLBACK_LIMIT: usize = 20;
 
 /// dmdata telegram.list をページングして初期一覧を取得する。
 /// `cache.feed_entries` 件集まるか、`nextToken` 枯渇か、ページ上限で停止する。
@@ -60,6 +66,67 @@ pub async fn load_initial_feed(
         "initial feeds loaded"
     );
     Ok(items)
+}
+
+/// `/latest` の初期値を作る。初期一覧に対象種別が無い場合のみ、telegram.list を
+/// 電文種別で絞って最新電文のIDを補完する(メタデータのみ。実体は初回アクセス時に
+/// CacheFill経路で遅延取得する)。補完の失敗は致命にしない(新着が来るまで404のまま)。
+pub async fn load_initial_latest(
+    api: &DmdataApi,
+    config: &Config,
+    initial_metas: &[ItemMeta],
+) -> LatestEntries {
+    let mut latest = LatestEntries::from_metas(initial_metas);
+    if latest.earthquake.is_none()
+        && let Some(meta) = find_latest_by_types(api, config, LATEST_EARTHQUAKE_TYPES).await
+    {
+        latest.offer(&meta, None);
+    }
+    if latest.tsunami.is_none()
+        && let Some(meta) = find_latest_by_types(api, config, LATEST_TSUNAMI_TYPES).await
+    {
+        latest.offer(&meta, None);
+    }
+    latest
+}
+
+/// telegram.list(type絞り込み)を1ページ取得し、updated最大の電文を返す。
+/// `dmdata.types` で受信対象外にした種別は問い合わせない(WSで更新されず古いまま残るため)。
+async fn find_latest_by_types(
+    api: &DmdataApi,
+    config: &Config,
+    latest_types: &[&str],
+) -> Option<ItemMeta> {
+    let types: Vec<String> = latest_types
+        .iter()
+        .filter(|t| type_matches(t, &config.dmdata.types))
+        .map(|t| t.to_string())
+        .collect();
+    if types.is_empty() {
+        return None;
+    }
+    let joined = types.join(",");
+    let page = match api
+        .telegram_list_by_types(&joined, LATEST_FALLBACK_LIMIT)
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!(error = %e, types = %joined, "latest fallback lookup failed");
+            return None;
+        }
+    };
+    // 一覧は受信順(新しい順)のため、ReportDateTime基準のupdatedで最大を取り直す
+    let found = page
+        .items
+        .iter()
+        .filter_map(|item| select_item(item, &types))
+        .max_by(|a, b| a.updated.cmp(&b.updated));
+    match &found {
+        Some(meta) => tracing::info!(types = %joined, id = %meta.id, "latest fallback found"),
+        None => tracing::info!(types = %joined, "latest fallback found nothing"),
+    }
+    found
 }
 
 /// telegram.list を1ページ、リトライ付きで取得する。
@@ -154,6 +221,7 @@ pub(crate) fn select_item(item: &TelegramListItem, types: &[String]) -> Option<I
         updated,
         author: control.publishing_office.unwrap_or_default(),
         content: xml_head.headline.unwrap_or_default(),
+        telegram_type: item.head.telegram_type.clone(),
     })
 }
 
@@ -204,6 +272,9 @@ pub async fn fetch_entity(state: SharedState, id: String, result_tx: InflightTx)
         updated: entity_meta.report_date_time,
         author: entity_meta.publishing_office,
         content: entity_meta.headline_text,
+        // 実体XMLは電文種別コードを持たない。CacheFillは一覧(metas)を更新しないため
+        // /latest の判定には影響しない
+        telegram_type: String::new(),
     };
 
     // 待機中のハンドラへ完成entryを即配布する(Bytes cloneは安価)。
@@ -286,6 +357,7 @@ mod tests {
         assert_eq!(meta.updated, "2026-07-08T10:00:00+09:00");
         assert_eq!(meta.author, "気象庁本庁");
         assert_eq!(meta.content, "地震がありました。");
+        assert_eq!(meta.telegram_type, "VXSE53");
     }
 
     #[test]
@@ -562,5 +634,131 @@ mod tests {
             .await
             .expect_err("warmup must fail after retries");
         assert!(error.to_string().contains("500"), "unexpected: {error}");
+    }
+
+    fn typed_meta(id: &str, telegram_type: &str, updated: &str) -> ItemMeta {
+        ItemMeta {
+            id: id.into(),
+            telegram_type: telegram_type.into(),
+            updated: updated.into(),
+            ..ItemMeta::default()
+        }
+    }
+
+    fn latest_id(latest: &Option<crate::types::LatestEntry>) -> Option<&str> {
+        latest.as_ref().map(|l| l.meta.id.as_str())
+    }
+
+    #[tokio::test]
+    async fn initial_latest_skips_lookup_when_initial_feed_has_both() {
+        let server = MockServer::start().await;
+        let config = test_config(&server, |_| {});
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let initial = [
+            typed_meta("ID_TS", "VTSE41", "2026-07-08T10:10:00+09:00"),
+            typed_meta("ID_EQ", "VXSE53", "2026-07-08T10:00:00+09:00"),
+        ];
+        let latest = load_initial_latest(&api(&config), &config, &initial).await;
+        assert_eq!(latest_id(&latest.earthquake), Some("ID_EQ"));
+        assert_eq!(latest_id(&latest.tsunami), Some("ID_TS"));
+    }
+
+    #[tokio::test]
+    async fn initial_latest_looks_up_missing_type_by_report_time() {
+        let server = MockServer::start().await;
+        let config = test_config(&server, |_| {});
+
+        // 受信順(新しい順)。テスト電文はskip、ReportDateTime最大の電文を採る
+        let mut body = list_body(
+            &[
+                ("ID_TEST", "2026-07-08T09:00:00+09:00"),
+                ("ID_OLDER", "2026-07-08T07:00:00+09:00"),
+                ("ID_NEWEST", "2026-07-08T08:00:00+09:00"),
+            ],
+            None,
+        );
+        for item in body["items"].as_array_mut().unwrap() {
+            item["head"]["type"] = serde_json::json!("VTSE41");
+        }
+        body["items"][0]["head"]["test"] = serde_json::json!(true);
+        Mock::given(method("GET"))
+            .and(path("/telegram"))
+            .and(query_param("type", "VTSE41"))
+            .and(query_param_is_missing("classification"))
+            .and(query_param("limit", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = [typed_meta("ID_EQ", "VXSE51", "2026-07-08T10:00:00+09:00")];
+        let latest = load_initial_latest(&api(&config), &config, &initial).await;
+        assert_eq!(latest_id(&latest.earthquake), Some("ID_EQ"));
+        let tsunami = latest.tsunami.expect("must be filled by lookup");
+        assert_eq!(tsunami.meta.id, "ID_NEWEST");
+        assert_eq!(tsunami.meta.telegram_type, "VTSE41");
+        // 実体は遅延取得
+        assert!(tsunami.entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn initial_latest_queries_earthquake_types_exactly() {
+        let server = MockServer::start().await;
+        let config = test_config(&server, |_| {});
+        Mock::given(method("GET"))
+            .and(path("/telegram"))
+            .and(query_param("type", "VXSE51,VXSE52,VXSE53"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list_body(
+                &[("ID_EQ_FALLBACK", "2026-07-08T08:00:00+09:00")],
+                None,
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let initial = [typed_meta("ID_TS", "VTSE41", "2026-07-08T10:00:00+09:00")];
+        let latest = load_initial_latest(&api(&config), &config, &initial).await;
+        assert_eq!(latest_id(&latest.earthquake), Some("ID_EQ_FALLBACK"));
+        assert_eq!(latest_id(&latest.tsunami), Some("ID_TS"));
+    }
+
+    #[tokio::test]
+    async fn initial_latest_lookup_failure_is_not_fatal() {
+        let server = MockServer::start().await;
+        let config = test_config(&server, |_| {});
+        Mock::given(method("GET"))
+            .and(path("/telegram"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let latest = load_initial_latest(&api(&config), &config, &[]).await;
+        assert!(latest.earthquake.is_none());
+        assert!(latest.tsunami.is_none());
+    }
+
+    #[tokio::test]
+    async fn initial_latest_skips_types_excluded_by_config() {
+        let server = MockServer::start().await;
+        // VTSE41 は受信対象外、地震はVXSE53のみ受信
+        let config = test_config(&server, |c| c.dmdata.types = vec!["VXSE53".into()]);
+        Mock::given(method("GET"))
+            .and(path("/telegram"))
+            .and(query_param("type", "VXSE53"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list_body(&[], None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let latest = load_initial_latest(&api(&config), &config, &[]).await;
+        assert!(latest.earthquake.is_none());
+        assert!(latest.tsunami.is_none());
+        // MockServer drop 時に expect(1)(=津波は問い合わせない)が検証される
     }
 }

@@ -128,6 +128,7 @@ mod tests {
             updated: "2026-07-05T04:10:12+09:00".into(),
             author: "気象庁".into(),
             content: "5日04時05分ころ、地震がありました。".into(),
+            telegram_type: "VXSE53".into(),
         }
     }
 
@@ -141,6 +142,7 @@ mod tests {
                 updated: "2026-07-05T04:07:03+09:00".into(),
                 author: "気象庁".into(),
                 content: "強い揺れを感じました。".into(),
+                telegram_type: "VXSE51".into(),
             },
         ];
         let xml = render(&metas, "http://127.0.0.1:8080/");

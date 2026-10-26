@@ -15,6 +15,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/developer/xml/feed/eqvol_l.xml", get(handlers::feed))
         // axum 0.8: `.xml` サフィックス付きパラメータは使えないためファイル名全体で受ける
         .route("/developer/xml/data/{file}", get(handlers::data))
+        .route("/latest/earthquake", get(handlers::latest_earthquake))
+        .route("/latest/tsunami", get(handlers::latest_tsunami))
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         // 未対応パスは上流JMAへ 307 転送(DNS捻じ曲げ時の他リソース到達用)

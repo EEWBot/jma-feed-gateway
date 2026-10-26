@@ -273,6 +273,33 @@ impl DmdataApi {
             .map_err(DmdataError::Http)
     }
 
+    /// GET /telegram(telegram.list)— 電文種別で絞り込んだ1ページ取得(新しい順)。
+    /// `types` はカンマ区切り(複数指定は完全一致・最大5件、単一指定は前方一致)。
+    /// `xmlReport=true`・`test=no` 固定。
+    pub async fn telegram_list_by_types(
+        &self,
+        types: &str,
+        limit: usize,
+    ) -> Result<TelegramListResponse, DmdataError> {
+        let response = self
+            .request(Method::GET, "/telegram")
+            .query(&[
+                ("type", types),
+                ("xmlReport", "true"),
+                ("test", "no"),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(Self::api_error(response).await);
+        }
+        response
+            .json::<TelegramListResponse>()
+            .await
+            .map_err(DmdataError::Http)
+    }
+
     /// GET {data_api_base}/{id}(telegram.data v1)— 電文本文の取得。
     /// gzip配信はreqwestのgzip機能で透過解凍される。
     pub async fn telegram_get(&self, id: &str) -> Result<Bytes, DmdataError> {
@@ -497,6 +524,30 @@ mod tests {
             .expect("must succeed");
         assert!(list.items.is_empty());
         assert!(list.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_list_by_types_sends_type_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/telegram"))
+            .and(header("Authorization", EXPECTED_AUTH))
+            .and(query_param("type", "VXSE51,VXSE52,VXSE53"))
+            .and(query_param("xmlReport", "true"))
+            .and(query_param("test", "no"))
+            .and(query_param("limit", "20"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TELEGRAM_LIST_JSON, "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let list = api(&server)
+            .telegram_list_by_types("VXSE51,VXSE52,VXSE53", 20)
+            .await
+            .expect("must succeed");
+        assert_eq!(list.items.len(), 3);
     }
 
     #[tokio::test]

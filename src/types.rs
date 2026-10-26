@@ -1,5 +1,7 @@
 //! モジュール間で共有するコア型。
 
+use std::sync::Arc;
+
 use axum::http::HeaderValue;
 use bytes::Bytes;
 
@@ -19,6 +21,95 @@ pub struct ItemMeta {
     pub author: String,
     /// Head/Headline/Text 相当。
     pub content: String,
+    /// 電文種別コード(dmdata head.type。例: VXSE53)。不明な場合は空文字列。
+    pub telegram_type: String,
+}
+
+/// `/latest/earthquake` の対象電文種別(震度速報 / 震源に関する情報 / 震源・震度に関する情報)。
+pub const LATEST_EARTHQUAKE_TYPES: &[&str] = &["VXSE51", "VXSE52", "VXSE53"];
+/// `/latest/tsunami` の対象電文種別(津波警報・注意報・予報a)。
+pub const LATEST_TSUNAMI_TYPES: &[&str] = &["VTSE41"];
+
+/// `/latest/*` が返す最新電文1件。
+#[derive(Debug, Clone)]
+pub struct LatestEntry {
+    pub meta: ItemMeta,
+    /// 実体。poll由来・ウォームアップ由来で未取得なら `None`
+    /// (CacheFillで届いた時点で aggregator が埋める)。
+    pub entry: Option<Arc<EntityEntry>>,
+}
+
+/// 種別ごとの最新電文の保管場所。feed(pinned / entities)とは独立に保持し、
+/// feedから押し出されても新しい電文が来るまで残る。本文はpinnedと同じ `Arc` を
+/// 共有するためコピーは発生しない。書き込みは aggregator のみで、
+/// `ArcSwap<LatestEntries>` で公開する。
+#[derive(Debug, Clone, Default)]
+pub struct LatestEntries {
+    pub earthquake: Option<LatestEntry>,
+    pub tsunami: Option<LatestEntry>,
+}
+
+impl LatestEntries {
+    /// 初期一覧(updated降順)から各種別の先頭一致を最新とする。実体は未取得(None)。
+    pub fn from_metas(metas: &[ItemMeta]) -> Self {
+        let mut latest = Self::default();
+        latest.offer_metas(metas);
+        latest
+    }
+
+    /// 一覧(updated降順)の各電文を実体なしで offer する。
+    pub fn offer_metas(&mut self, metas: &[ItemMeta]) {
+        // 古い順に offer すれば先頭一致が最後に勝つ(同一updatedも先頭優先になる)
+        for meta in metas.iter().rev() {
+            self.offer(meta, None);
+        }
+    }
+
+    /// 対象種別で、保持中の電文以上に新しければ差し替える。差し替えたら true。
+    /// updated は+09:00正規化済みRFC3339なので辞書順比較=時系列比較。
+    pub fn offer(&mut self, meta: &ItemMeta, entry: Option<&Arc<EntityEntry>>) -> bool {
+        let Some(slot) = self.slot_mut(&meta.telegram_type) else {
+            return false;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.meta.updated > meta.updated)
+        {
+            return false;
+        }
+        *slot = Some(LatestEntry {
+            meta: meta.clone(),
+            entry: entry.cloned(),
+        });
+        true
+    }
+
+    /// 実体未取得のスロットがこのIDなら実体を埋める。埋めたら true。
+    /// CacheFill由来のmetaは電文種別を持たないためIDで照合する。
+    pub fn fill(&mut self, id: &str, entry: &Arc<EntityEntry>) -> bool {
+        let mut filled = false;
+        for latest in [&mut self.earthquake, &mut self.tsunami]
+            .into_iter()
+            .flatten()
+        {
+            if latest.entry.is_none() && latest.meta.id == id {
+                latest.entry = Some(Arc::clone(entry));
+                filled = true;
+            }
+        }
+        filled
+    }
+
+    fn slot_mut(&mut self, telegram_type: &str) -> Option<&mut Option<LatestEntry>> {
+        let is = |types: &[&str]| types.iter().any(|t| t.eq_ignore_ascii_case(telegram_type));
+        if is(LATEST_EARTHQUAKE_TYPES) {
+            Some(&mut self.earthquake)
+        } else if is(LATEST_TSUNAMI_TYPES) {
+            Some(&mut self.tsunami)
+        } else {
+            None
+        }
+    }
 }
 
 /// イベントの発生源。
@@ -209,6 +300,86 @@ mod tests {
     fn normalize_rfc3339_passes_through_unparsable_input() {
         assert_eq!(normalize_rfc3339_to_jst("not-a-date"), "not-a-date");
         assert_eq!(normalize_rfc3339_to_jst(""), "");
+    }
+
+    fn typed_meta(id: &str, telegram_type: &str, updated: &str) -> ItemMeta {
+        ItemMeta {
+            id: id.into(),
+            telegram_type: telegram_type.into(),
+            updated: updated.into(),
+            ..ItemMeta::default()
+        }
+    }
+
+    fn latest_id(latest: &Option<LatestEntry>) -> Option<&str> {
+        latest.as_ref().map(|l| l.meta.id.as_str())
+    }
+
+    fn entity(body: &'static [u8]) -> Arc<EntityEntry> {
+        Arc::new(EntityEntry::new(
+            Bytes::from_static(body),
+            ItemMeta::default(),
+        ))
+    }
+
+    #[test]
+    fn latest_from_metas_picks_first_match_per_category() {
+        // フィード順(updated降順)。同一updatedは先頭(フィード上位)が勝つ
+        let metas = vec![
+            typed_meta("ID_VXSE61", "VXSE61", "2026-07-05T04:30:00+09:00"),
+            typed_meta("ID_VXSE52", "VXSE52", "2026-07-05T04:20:00+09:00"),
+            typed_meta("ID_VTSE41_NEW", "VTSE41", "2026-07-05T04:20:00+09:00"),
+            typed_meta("ID_VXSE53", "VXSE53", "2026-07-05T04:20:00+09:00"),
+            typed_meta("ID_VTSE41_OLD", "vtse41", "2026-07-05T04:10:00+09:00"),
+        ];
+        let latest = LatestEntries::from_metas(&metas);
+        assert_eq!(latest_id(&latest.earthquake), Some("ID_VXSE52"));
+        assert_eq!(latest_id(&latest.tsunami), Some("ID_VTSE41_NEW"));
+        assert!(latest.earthquake.unwrap().entry.is_none());
+    }
+
+    #[test]
+    fn latest_from_metas_none_when_absent() {
+        let metas = vec![
+            typed_meta("ID_VTSE51", "VTSE51", "2026-07-05T04:10:00+09:00"),
+            typed_meta("ID_X", "", "2026-07-05T04:00:00+09:00"),
+        ];
+        let latest = LatestEntries::from_metas(&metas);
+        assert!(latest.earthquake.is_none());
+        assert!(latest.tsunami.is_none());
+    }
+
+    #[test]
+    fn latest_offer_keeps_newer_and_ignores_other_types() {
+        let mut latest = LatestEntries::default();
+        let new = typed_meta("ID_NEW", "VXSE53", "2026-07-05T04:20:00+09:00");
+        assert!(latest.offer(&new, Some(&entity(b"new"))));
+        // 遅延publishされた古い電文では差し替わらない
+        let old = typed_meta("ID_OLD", "VXSE51", "2026-07-05T04:00:00+09:00");
+        assert!(!latest.offer(&old, None));
+        // 対象外種別は無視
+        let other = typed_meta("ID_VXSE61", "VXSE61", "2026-07-05T05:00:00+09:00");
+        assert!(!latest.offer(&other, None));
+
+        let eq = latest.earthquake.as_ref().unwrap();
+        assert_eq!(eq.meta.id, "ID_NEW");
+        assert_eq!(&eq.entry.as_ref().unwrap().body[..], b"new");
+        assert!(latest.tsunami.is_none());
+    }
+
+    #[test]
+    fn latest_fill_only_fills_missing_entry_with_matching_id() {
+        let mut latest = LatestEntries::default();
+        latest.offer(
+            &typed_meta("ID_TS", "VTSE41", "2026-07-05T04:20:00+09:00"),
+            None,
+        );
+        assert!(!latest.fill("ID_OTHER", &entity(b"other")));
+        assert!(latest.fill("ID_TS", &entity(b"filled")));
+        // 埋まった後は上書きしない
+        assert!(!latest.fill("ID_TS", &entity(b"again")));
+        let ts = latest.tsunami.as_ref().unwrap();
+        assert_eq!(&ts.entry.as_ref().unwrap().body[..], b"filled");
     }
 
     #[test]
