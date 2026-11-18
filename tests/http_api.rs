@@ -1002,3 +1002,41 @@ async fn latest_fetch_timeout_returns_504() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
 }
+
+/// 前の本文と Last-Modified を共有するスナップショット(同一秒内の再変更)を差し込む。
+fn store_shared_last_modified_feed(state: &SharedState) {
+    let lm = jma_feed_gateway::types::parse_imf_fixdate(FEED_LAST_MODIFIED).unwrap();
+    state.feed.store(Arc::new(FeedSnapshot::with_last_modified(
+        Bytes::from_static(b"<?xml version=\"1.0\"?><feed>second version</feed>"),
+        "2026-07-05T04:10:12+09:00".into(),
+        Some(lm),
+        true,
+    )));
+}
+
+#[tokio::test]
+async fn feed_shared_last_modified_suppresses_if_modified_since_304() {
+    let (state, router) = setup().await;
+    store_shared_last_modified_feed(&state);
+
+    // 一致・未来の IMS でも200(公開時に固定した値をそのまま送る)
+    for ims in [FEED_LAST_MODIFIED, "Sat, 04 Jul 2026 20:00:00 GMT"] {
+        let response =
+            get_with_headers(&router, FEED_PATH, &[(header::IF_MODIFIED_SINCE, ims)]).await;
+        assert_eq!(response.status(), StatusCode::OK, "IMS {ims}");
+        assert_eq!(
+            header_str(&response, "last-modified"),
+            Some(FEED_LAST_MODIFIED)
+        );
+    }
+}
+
+#[tokio::test]
+async fn feed_shared_last_modified_still_honors_if_none_match() {
+    let (state, router) = setup().await;
+    store_shared_last_modified_feed(&state);
+    let etag = state.feed.load_full().etag.clone();
+
+    let response = get(&router, FEED_PATH, Some(&etag)).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+}

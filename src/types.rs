@@ -241,10 +241,14 @@ pub struct FeedSnapshot {
     pub etag_header: HeaderValue,
     /// フィードの updated(RFC3339文字列)。
     pub last_updated: String,
-    /// `Last-Modified` 用時刻(単調化済み。aggregator::publish が計算)。
+    /// `Last-Modified` 用時刻(単調化済み。aggregator::publish が公開時に確定し、以後変えない)。
     pub last_modified: Option<time::OffsetDateTime>,
     /// `last_modified` のIMF-fixdate `HeaderValue`(事前生成)。
     pub last_modified_header: Option<HeaderValue>,
+    /// `last_modified` を前のスナップショット(別の本文)と共有している。
+    /// Date より未来の値を出せないため同一秒内の再変更では時刻を進められず、
+    /// この値では版を区別できない。`If-Modified-Since` による304を抑止する。
+    pub last_modified_shared: bool,
 }
 
 impl FeedSnapshot {
@@ -252,6 +256,15 @@ impl FeedSnapshot {
         body: Bytes,
         last_updated: String,
         last_modified: Option<time::OffsetDateTime>,
+    ) -> Self {
+        Self::with_last_modified(body, last_updated, last_modified, false)
+    }
+
+    pub fn with_last_modified(
+        body: Bytes,
+        last_updated: String,
+        last_modified: Option<time::OffsetDateTime>,
+        last_modified_shared: bool,
     ) -> Self {
         let etag = compute_etag(&body);
         let etag_header =
@@ -267,6 +280,7 @@ impl FeedSnapshot {
             last_updated,
             last_modified,
             last_modified_header,
+            last_modified_shared,
         }
     }
 
@@ -274,11 +288,51 @@ impl FeedSnapshot {
     pub fn empty() -> Self {
         Self::new(Bytes::new(), String::new(), None)
     }
+
+    /// `If-Modified-Since` を評価し、304を返してよければ true。
+    ///
+    /// `last_modified` は公開ごとに狭義単調増加し、共有された値では304にしない。
+    /// したがって304になるのは、IMS がこのスナップショット自身の応答から得た値
+    /// (以上)の場合に限られ、どの時点で応答を組み立てても別版を取り違えない。
+    pub fn not_modified_since(&self, if_modified_since: &str) -> bool {
+        !self.last_modified_shared
+            && self
+                .last_modified
+                .is_some_and(|lm| crate::http::etag::not_modified_since(if_modified_since, lm))
+    }
+}
+
+/// IMF-fixdateは秒粒度のため、`Last-Modified` の比較・繰り上げは秒単位で行う。
+pub fn truncate_to_second(dt: time::OffsetDateTime) -> time::OffsetDateTime {
+    dt.replace_nanosecond(0)
+        .expect("0 is always a valid nanosecond")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(lm: time::OffsetDateTime, shared: bool) -> FeedSnapshot {
+        FeedSnapshot::with_last_modified(Bytes::from_static(b"x"), String::new(), Some(lm), shared)
+    }
+
+    #[test]
+    fn unique_last_modified_allows_304() {
+        let s = snapshot(time::macros::datetime!(2026-07-05 04:20:00 UTC), false);
+        assert!(s.not_modified_since("Sun, 05 Jul 2026 04:20:00 GMT"));
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 04:19:59 GMT"));
+    }
+
+    #[test]
+    fn shared_last_modified_never_allows_304() {
+        let s = snapshot(time::macros::datetime!(2026-07-05 04:20:00 UTC), true);
+        assert_eq!(
+            s.last_modified_header.as_ref().unwrap(),
+            "Sun, 05 Jul 2026 04:20:00 GMT"
+        );
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 04:20:00 GMT"));
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 05:00:00 GMT"));
+    }
 
     #[test]
     fn normalize_rfc3339_converts_utc_z_to_jst() {

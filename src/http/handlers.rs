@@ -79,15 +79,10 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
     {
         // If-None-Match があれば If-Modified-Since は無視
         Some(inm) => etag::if_none_match(inm, &snapshot.etag),
-        None => match (
-            headers
-                .get(header::IF_MODIFIED_SINCE)
-                .and_then(|v| v.to_str().ok()),
-            snapshot.last_modified,
-        ) {
-            (Some(ims), Some(lm)) => etag::not_modified_since(ims, lm),
-            _ => false,
-        },
+        None => headers
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ims| snapshot.not_modified_since(ims)),
     };
 
     let mut response = if not_modified {
