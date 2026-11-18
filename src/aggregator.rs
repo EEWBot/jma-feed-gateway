@@ -142,23 +142,130 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .map(|m| m.updated.clone())
         .unwrap_or_else(feed_render::now_jst_rfc3339);
 
-    // Last-Modified 用時刻: パース可能な updated の最大値を取り、前スナップショットより
-    // 小さくならないよう clamp(訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
+    // Last-Modified 用時刻の算出は next_last_modified を参照。
     // feed本文の <updated> は従来どおり先頭entryの値のまま。
     let rfc3339 = time::format_description::well_known::Rfc3339;
     let max_updated = slice
         .iter()
         .filter_map(|m| time::OffsetDateTime::parse(&m.updated, &rfc3339).ok())
         .max();
-    let previous = state.feed.load().last_modified;
-    let last_modified = match (max_updated, previous) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    };
+    let previous = state.feed.load();
+    let body_changed = previous.body != body;
+    let last_modified = next_last_modified(
+        max_updated,
+        previous.last_modified,
+        body_changed,
+        time::OffsetDateTime::now_utc(),
+    );
 
     state.feed.store(Arc::new(FeedSnapshot::new(
         body,
         last_updated,
         last_modified,
     )));
+}
+
+/// `Last-Modified` 用時刻を決める。
+///
+/// 基本は「パース可能な updated の最大値」を前回値より小さくならないよう clamp した値
+/// (訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
+///
+/// ただし本文が変わったのに、その値が前回値から(IMF-fixdateの秒粒度で)進まない場合がある。
+/// 同一発表時刻の電文が続く場合や、古い updated の電文が遅れて届いた場合である。このとき
+/// `If-Modified-Since` だけで再検証するクライアントに古い本文のまま 304 を返してしまう。
+/// そこで、本文が変わったときは前回値より必ず1秒以上進める。その時刻は現在時刻と
+/// 前回値+1秒の遅い方とする。同一秒内に変更が連続すると現在時刻より先行し得るが、
+/// 304判定は自サーバが出した値同士の比較なので整合は保たれる。
+fn next_last_modified(
+    max_updated: Option<time::OffsetDateTime>,
+    previous: Option<time::OffsetDateTime>,
+    body_changed: bool,
+    now: time::OffsetDateTime,
+) -> Option<time::OffsetDateTime> {
+    let Some(previous) = previous else {
+        return max_updated;
+    };
+    let candidate = max_updated.map_or(previous, |a| a.max(previous));
+    if !body_changed || truncate_to_second(candidate) > truncate_to_second(previous) {
+        return Some(candidate);
+    }
+    let bumped = truncate_to_second(previous) + time::Duration::SECOND;
+    Some(bumped.max(truncate_to_second(now).to_offset(bumped.offset())))
+}
+
+/// IMF-fixdateは秒粒度のため、比較・繰り上げは秒単位で行う。
+fn truncate_to_second(dt: time::OffsetDateTime) -> time::OffsetDateTime {
+    dt.replace_nanosecond(0)
+        .expect("0 is always a valid nanosecond")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const NOW: time::OffsetDateTime = datetime!(2026-07-05 04:20:00.5 +09:00);
+
+    #[test]
+    fn first_publish_uses_max_updated() {
+        let a = datetime!(2026-07-05 04:10:00 +09:00);
+        assert_eq!(next_last_modified(Some(a), None, true, NOW), Some(a));
+        assert_eq!(next_last_modified(None, None, true, NOW), None);
+    }
+
+    #[test]
+    fn newer_updated_advances() {
+        let prev = datetime!(2026-07-05 04:10:00 +09:00);
+        let a = datetime!(2026-07-05 04:15:00 +09:00);
+        assert_eq!(next_last_modified(Some(a), Some(prev), true, NOW), Some(a));
+    }
+
+    #[test]
+    fn unchanged_body_keeps_previous() {
+        let prev = datetime!(2026-07-05 04:10:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(prev), Some(prev), false, NOW),
+            Some(prev)
+        );
+    }
+
+    #[test]
+    fn changed_body_with_same_updated_bumps_to_now() {
+        let prev = datetime!(2026-07-05 04:10:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(prev), Some(prev), true, NOW),
+            Some(datetime!(2026-07-05 04:20:00 +09:00))
+        );
+    }
+
+    #[test]
+    fn changed_body_with_older_updated_bumps() {
+        let prev = datetime!(2026-07-05 04:10:00 +09:00);
+        let older = datetime!(2026-07-05 04:05:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(older), Some(prev), true, NOW),
+            Some(datetime!(2026-07-05 04:20:00 +09:00))
+        );
+    }
+
+    #[test]
+    fn bump_is_at_least_one_second_when_previous_is_ahead_of_now() {
+        // 同一秒内の連続変更で前回値が現在時刻より先行している場合
+        let prev = datetime!(2026-07-05 04:20:03 +09:00);
+        assert_eq!(
+            next_last_modified(Some(prev), Some(prev), true, NOW),
+            Some(datetime!(2026-07-05 04:20:04 +09:00))
+        );
+    }
+
+    #[test]
+    fn subsecond_advance_within_same_second_still_bumps() {
+        // IMF-fixdate上で同じ秒になる前進は「進んだ」とみなさない
+        let prev = datetime!(2026-07-05 04:20:10.1 +09:00);
+        let a = datetime!(2026-07-05 04:20:10.9 +09:00);
+        assert_eq!(
+            next_last_modified(Some(a), Some(prev), true, NOW),
+            Some(datetime!(2026-07-05 04:20:11 +09:00))
+        );
+    }
 }

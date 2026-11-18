@@ -869,16 +869,73 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
 
     let snapshot2 = state.feed.load_full();
     let lm2 = snapshot2.last_modified.expect("last_modified must be set");
-    assert_eq!(lm2, lm1, "last_modified must not regress");
+    // 後退しないだけでなく、本文が変わったので秒粒度で必ず前進する
+    // (If-Modified-Since のみのクライアントに古い本文で304を返さないため)
+    assert!(lm2 > lm1, "last_modified must advance when body changes");
+    assert!(
+        !jma_feed_gateway::http::etag::not_modified_since(
+            snapshot1
+                .last_modified_header
+                .as_ref()
+                .and_then(|v| v.to_str().ok())
+                .unwrap(),
+            lm2,
+        ),
+        "IMS of previous snapshot must not yield 304"
+    );
     // 順序挿入により古いentryは先頭に来ない → feed本文の<updated>(先頭entry)は最大値のまま
     assert_eq!(snapshot2.last_updated, "2026-07-05T04:20:00+09:00");
     // HTTP用HeaderValueも事前計算されている
     assert_eq!(
-        snapshot2
+        snapshot1
             .last_modified_header
             .as_ref()
             .and_then(|v| v.to_str().ok()),
         Some("Sat, 04 Jul 2026 19:20:00 GMT")
+    );
+    assert!(snapshot2.last_modified_header.is_some());
+}
+
+#[tokio::test]
+async fn last_modified_advances_for_same_updated_telegrams() {
+    let (state, tx) = setup(10, Vec::new()).await;
+    let etag0 = state.feed.load_full().etag.clone();
+
+    tx.send(dmdata_event(
+        "t-a",
+        meta("id-a", "震源・震度情報", "2026-07-05T04:20:00+09:00"),
+    ))
+    .await
+    .unwrap();
+    wait_for_feed_change(&state, &etag0).await;
+    let snapshot1 = state.feed.load_full();
+    let ims = snapshot1
+        .last_modified_header
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    // 同一発表時刻の別電文
+    tx.send(dmdata_event(
+        "t-b",
+        meta(
+            "id-b",
+            "長周期地震動に関する観測情報",
+            "2026-07-05T04:20:00+09:00",
+        ),
+    ))
+    .await
+    .unwrap();
+    let body = wait_for_feed_change(&state, &snapshot1.etag).await;
+    assert!(body.contains("id-b"));
+
+    let snapshot2 = state.feed.load_full();
+    let lm2 = snapshot2.last_modified.expect("last_modified must be set");
+    assert!(lm2 > snapshot1.last_modified.unwrap());
+    assert!(
+        !jma_feed_gateway::http::etag::not_modified_since(&ims, lm2),
+        "IMS-only client must get 200 for the changed feed"
     );
 }
 
