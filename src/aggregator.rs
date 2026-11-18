@@ -157,30 +157,29 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .filter_map(|m| time::OffsetDateTime::parse(&m.updated, &rfc3339).ok())
         .max();
     let now = time::OffsetDateTime::now_utc();
-    let previous_lm = previous.last_modified_at(now).map(|lm| lm.value);
-    let next = next_last_modified(max_updated, previous_lm, now);
+    let next = next_last_modified(max_updated, previous.last_modified, now);
 
     state.feed.store(Arc::new(FeedSnapshot::with_last_modified(
         body,
         last_updated,
         next.map(|(value, _)| value),
-        next.is_some_and(|(_, ambiguous)| ambiguous),
+        next.is_some_and(|(_, shared)| shared),
     )));
 }
 
-/// 本文が変わったときの `Last-Modified` 用時刻と、その秒が曖昧かどうかを決める。
+/// 本文が変わったときの `Last-Modified` 用時刻と、それを前の本文と共有するかを決める。
+/// 値は公開時に確定し、以後変えない。
 ///
-/// - 基本は「パース可能な updated の最大値」を、前回の送出値より小さくならないよう
+/// - 基本は「パース可能な updated の最大値」を、前回値より小さくならないよう
 ///   clamp した値(訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
 /// - Date より未来の値は生成してはならない(RFC 9110 §8.8.2.1)ため `now` で頭打ちにする
 ///   (dmdataとの時計のずれで updated が未来になる場合も含む)。
 /// - 本文が変わったのに前回値から秒粒度で進まない場合(同一発表時刻の電文が続く・
 ///   古い updated の電文が遅れて届く)、そのままでは `If-Modified-Since` のみで再検証する
 ///   クライアントに古い本文で304を返してしまう。そこで現在時刻へ進める。
-/// - 現在時刻も前回値と同じ秒なら、Dateを超えずに進める手段がない。前回値のまま
-///   「曖昧」とし、その秒の間は弱い検証子として扱う([`FeedSnapshot::last_modified_at`])。
+/// - 現在時刻も前回値と同じ秒なら、Dateを超えずに進める手段がない。前回値を共有し、
+///   次に時刻が進む本文更新まで日時ベースの304を抑止する([`FeedSnapshot::not_modified_since`])。
 ///
-/// `previous` は前スナップショットの現時点での送出値(曖昧な秒を過ぎていれば+1秒済み)。
 /// 戻り値は秒単位に切り捨て済み。
 fn next_last_modified(
     max_updated: Option<time::OffsetDateTime>,
@@ -199,7 +198,7 @@ fn next_last_modified(
     if now > previous {
         return Some((now, false));
     }
-    // 同一秒内の再変更(または時計の後退)。単調性を優先して前回値を保つ
+    // 同一秒内の再変更(または時計の後退)。単調性を優先して前回値を共有する
     Some((previous, true))
 }
 
@@ -262,8 +261,8 @@ mod tests {
     }
 
     #[test]
-    fn change_within_same_second_as_previous_is_ambiguous() {
-        // 前回値が現在と同じ秒: Dateを超えて進められないので曖昧として保つ
+    fn change_within_same_second_as_previous_is_shared() {
+        // 前回値が現在と同じ秒: Dateを超えて進められないので前回値を共有する
         let prev = datetime!(2026-07-05 04:20:00 +09:00);
         assert_eq!(
             next_last_modified(Some(prev), Some(prev), NOW),
@@ -272,12 +271,41 @@ mod tests {
     }
 
     #[test]
-    fn clock_going_backwards_keeps_previous_as_ambiguous() {
+    fn clock_going_backwards_shares_previous() {
         let prev = datetime!(2026-07-05 04:20:03 +09:00);
         assert_eq!(
             next_last_modified(Some(prev), Some(prev), NOW),
             Some((prev, true))
         );
+    }
+
+    #[test]
+    fn burst_across_second_boundary_never_confuses_versions() {
+        // 02:31:56 内に A→B→C が公開され、02:31:57 に D が公開される。
+        // 応答をどの時点で組み立てても Last-Modified は公開時の値のまま。
+        let s56 = datetime!(2026-07-05 02:31:56 +09:00);
+        let s57 = datetime!(2026-07-05 02:31:57 +09:00);
+        let old = Some(datetime!(2026-07-05 02:00:00 +09:00));
+        let snap = |(lm, shared): (time::OffsetDateTime, bool)| {
+            FeedSnapshot::with_last_modified(bytes::Bytes::new(), String::new(), Some(lm), shared)
+        };
+        let ims56 = "Sat, 04 Jul 2026 17:31:56 GMT";
+        let ims57 = "Sat, 04 Jul 2026 17:31:57 GMT";
+
+        let a = next_last_modified(old, Some(datetime!(2026-07-05 02:30:00 +09:00)), s56).unwrap();
+        assert_eq!(a, (s56, false));
+        let b = next_last_modified(old, Some(a.0), s56).unwrap();
+        assert_eq!(b, (s56, true));
+        // B の応答は(組み立てが 02:31:57 にずれても)02:31:56 を送る。
+        // C も 02:31:56 を共有するので IMS=02:31:56 では304にならない
+        let c = next_last_modified(old, Some(b.0), s56).unwrap();
+        assert_eq!(c, (s56, true));
+        assert!(!snap(c).not_modified_since(ims56));
+        // 次の更新で時刻が進めば共有が解け、日時ベースの304が戻る
+        let d = next_last_modified(old, Some(c.0), s57).unwrap();
+        assert_eq!(d, (s57, false));
+        assert!(!snap(d).not_modified_since(ims56));
+        assert!(snap(d).not_modified_since(ims57));
     }
 
     #[test]

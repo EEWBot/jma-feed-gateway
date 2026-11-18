@@ -1003,64 +1003,40 @@ async fn latest_fetch_timeout_returns_504() {
     assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
 }
 
-/// 同一秒内に本文が複数回変わったスナップショット(曖昧な秒)を差し込む。
-fn store_ambiguous_feed(state: &SharedState, last_modified: time::OffsetDateTime) {
+/// 前の本文と Last-Modified を共有するスナップショット(同一秒内の再変更)を差し込む。
+fn store_shared_last_modified_feed(state: &SharedState) {
+    let lm = jma_feed_gateway::types::parse_imf_fixdate(FEED_LAST_MODIFIED).unwrap();
     state.feed.store(Arc::new(FeedSnapshot::with_last_modified(
         Bytes::from_static(b"<?xml version=\"1.0\"?><feed>second version</feed>"),
         "2026-07-05T04:10:12+09:00".into(),
-        Some(last_modified),
+        Some(lm),
         true,
     )));
 }
 
 #[tokio::test]
-async fn feed_ambiguous_second_never_returns_304_for_if_modified_since() {
+async fn feed_shared_last_modified_suppresses_if_modified_since_304() {
     let (state, router) = setup().await;
-    // 現在の秒を曖昧にする。テスト中に秒をまたいでも+1秒の値と比べるので200になる
-    let now = time::OffsetDateTime::now_utc()
-        .replace_nanosecond(0)
-        .unwrap();
-    store_ambiguous_feed(&state, now);
-    let ims = jma_feed_gateway::types::format_imf_fixdate(now);
+    store_shared_last_modified_feed(&state);
 
-    let response = get_with_headers(&router, FEED_PATH, &[(header::IF_MODIFIED_SINCE, &ims)]).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    // 送出する Last-Modified は Date(=現在)を超えない
-    let lm = header_str(&response, "last-modified").unwrap();
-    let lm = jma_feed_gateway::types::parse_imf_fixdate(lm).unwrap();
-    assert!(lm <= time::OffsetDateTime::now_utc());
+    // 一致・未来の IMS でも200(公開時に固定した値をそのまま送る)
+    for ims in [FEED_LAST_MODIFIED, "Sat, 04 Jul 2026 20:00:00 GMT"] {
+        let response =
+            get_with_headers(&router, FEED_PATH, &[(header::IF_MODIFIED_SINCE, ims)]).await;
+        assert_eq!(response.status(), StatusCode::OK, "IMS {ims}");
+        assert_eq!(
+            header_str(&response, "last-modified"),
+            Some(FEED_LAST_MODIFIED)
+        );
+    }
 }
 
 #[tokio::test]
-async fn feed_ambiguous_second_advances_by_one_second_after_it_passes() {
+async fn feed_shared_last_modified_still_honors_if_none_match() {
     let (state, router) = setup().await;
-    // FEED_LAST_MODIFIED の秒は既に過去
-    let lm = jma_feed_gateway::types::parse_imf_fixdate(FEED_LAST_MODIFIED).unwrap();
-    store_ambiguous_feed(&state, lm);
+    store_shared_last_modified_feed(&state);
+    let etag = state.feed.load_full().etag.clone();
 
-    // 曖昧な秒の値を持つクライアントには200 + 1秒進めた Last-Modified
-    let response = get_with_headers(
-        &router,
-        FEED_PATH,
-        &[(header::IF_MODIFIED_SINCE, FEED_LAST_MODIFIED)],
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&response, "last-modified"),
-        Some("Sat, 04 Jul 2026 19:10:13 GMT")
-    );
-
-    // 進めた値での再検証は304
-    let response = get_with_headers(
-        &router,
-        FEED_PATH,
-        &[(header::IF_MODIFIED_SINCE, "Sat, 04 Jul 2026 19:10:13 GMT")],
-    )
-    .await;
+    let response = get(&router, FEED_PATH, Some(&etag)).await;
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(
-        header_str(&response, "last-modified"),
-        Some("Sat, 04 Jul 2026 19:10:13 GMT")
-    );
 }

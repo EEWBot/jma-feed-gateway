@@ -72,9 +72,6 @@ fn serve_cached(headers: &HeaderMap, entry: &EntityEntry, cache_control: HeaderV
 pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     // Guard を .await 跨ぎで持たないよう load_full で Arc を取り出す
     let snapshot = state.feed.load_full();
-    // Date はこの後(応答書き出し時)に付くため、ここで取った now 以下の値は Date を超えない
-    let now = time::OffsetDateTime::now_utc();
-    let last_modified = snapshot.last_modified_at(now);
 
     let not_modified = match headers
         .get(header::IF_NONE_MATCH)
@@ -85,7 +82,7 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         None => headers
             .get(header::IF_MODIFIED_SINCE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ims| snapshot.not_modified_since(ims, now)),
+            .is_some_and(|ims| snapshot.not_modified_since(ims)),
     };
 
     let mut response = if not_modified {
@@ -112,8 +109,8 @@ pub async fn feed(State(state): State<SharedState>, headers: HeaderMap) -> Respo
     };
 
     let response_headers = response.headers_mut();
-    if let Some(lm) = last_modified {
-        response_headers.insert(header::LAST_MODIFIED, lm.header.clone());
+    if let Some(lm) = &snapshot.last_modified_header {
+        response_headers.insert(header::LAST_MODIFIED, lm.clone());
     }
     response_headers.insert(X_INSTANCE_STARTED, state.started_at_header.clone());
     response

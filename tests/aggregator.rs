@@ -873,13 +873,12 @@ async fn last_modified_is_monotonic_under_out_of_order_updated() {
     // (If-Modified-Since のみのクライアントに古い本文で304を返さないため)
     assert!(lm2 > lm1, "last_modified must advance when body changes");
     assert!(
-        !jma_feed_gateway::http::etag::not_modified_since(
+        !snapshot2.not_modified_since(
             snapshot1
                 .last_modified_header
                 .as_ref()
                 .and_then(|v| v.to_str().ok())
                 .unwrap(),
-            lm2,
         ),
         "IMS of previous snapshot must not yield 304"
     );
@@ -934,7 +933,7 @@ async fn last_modified_advances_for_same_updated_telegrams() {
     let lm2 = snapshot2.last_modified.expect("last_modified must be set");
     assert!(lm2 > snapshot1.last_modified.unwrap());
     assert!(
-        !jma_feed_gateway::http::etag::not_modified_since(&ims, lm2),
+        !snapshot2.not_modified_since(&ims),
         "IMS-only client must get 200 for the changed feed"
     );
 }
@@ -1174,23 +1173,23 @@ async fn last_modified_never_exceeds_now_under_burst() {
         etag = snapshot.etag.clone();
 
         let now = time::OffsetDateTime::now_utc();
-        let lm = snapshot
-            .last_modified_at(now)
-            .expect("last_modified must be set");
-        assert!(
-            lm.value <= now,
-            "Last-Modified {} exceeds now {now}",
-            lm.value
-        );
+        let lm = snapshot.last_modified.expect("last_modified must be set");
+        assert!(lm <= now, "Last-Modified {lm} exceeds now {now}");
         // 以前の版で得た Last-Modified による再検証は、どれも304にならない
         for ims in &seen_ims {
             assert!(
-                !snapshot.not_modified_since(ims, now),
-                "stale IMS {ims} must not yield 304 (lm={}, weak={})",
-                lm.value,
-                lm.weak
+                !snapshot.not_modified_since(ims),
+                "stale IMS {ims} must not yield 304 (lm={lm}, shared={})",
+                snapshot.last_modified_shared
             );
         }
-        seen_ims.push(lm.header.to_str().unwrap().to_string());
+        seen_ims.push(
+            snapshot
+                .last_modified_header
+                .as_ref()
+                .and_then(|v| v.to_str().ok())
+                .unwrap()
+                .to_string(),
+        );
     }
 }
