@@ -242,9 +242,25 @@ pub struct FeedSnapshot {
     /// フィードの updated(RFC3339文字列)。
     pub last_updated: String,
     /// `Last-Modified` 用時刻(単調化済み。aggregator::publish が計算)。
+    /// 送出値は時刻に依存するため、応答では [`FeedSnapshot::last_modified_at`] を使う。
     pub last_modified: Option<time::OffsetDateTime>,
     /// `last_modified` のIMF-fixdate `HeaderValue`(事前生成)。
     pub last_modified_header: Option<HeaderValue>,
+    /// `last_modified` の秒の間に本文が複数回変わった(=その秒の値では版を区別できない)。
+    /// Date より未来の値は出せないため、この秒の間は弱い検証子として扱い、
+    /// 秒を過ぎたら `last_modified + 1秒` を送出する。
+    pub last_modified_ambiguous: bool,
+    /// `last_modified + 1秒` の `HeaderValue`(ambiguous時のみ事前生成)。
+    last_modified_next_header: Option<HeaderValue>,
+}
+
+/// ある時刻に送出する `Last-Modified`。
+#[derive(Debug, Clone, Copy)]
+pub struct LastModifiedAt<'a> {
+    pub value: time::OffsetDateTime,
+    pub header: &'a HeaderValue,
+    /// 同一秒内の別版と区別できない(`If-Modified-Since` で304にしてはならない)。
+    pub weak: bool,
 }
 
 impl FeedSnapshot {
@@ -253,13 +269,26 @@ impl FeedSnapshot {
         last_updated: String,
         last_modified: Option<time::OffsetDateTime>,
     ) -> Self {
+        Self::with_last_modified(body, last_updated, last_modified, false)
+    }
+
+    pub fn with_last_modified(
+        body: Bytes,
+        last_updated: String,
+        last_modified: Option<time::OffsetDateTime>,
+        last_modified_ambiguous: bool,
+    ) -> Self {
         let etag = compute_etag(&body);
         let etag_header =
             HeaderValue::from_str(&etag).expect("etag is always a valid header value");
-        let last_modified_header = last_modified.map(|dt| {
+        let imf_header = |dt| {
             HeaderValue::from_str(&format_imf_fixdate(dt))
                 .expect("imf-fixdate is always a valid header value")
-        });
+        };
+        let last_modified_header = last_modified.map(imf_header);
+        let last_modified_next_header = last_modified
+            .filter(|_| last_modified_ambiguous)
+            .map(|dt| imf_header(truncate_to_second(dt) + time::Duration::SECOND));
         Self {
             body,
             etag,
@@ -267,6 +296,8 @@ impl FeedSnapshot {
             last_updated,
             last_modified,
             last_modified_header,
+            last_modified_ambiguous,
+            last_modified_next_header,
         }
     }
 
@@ -274,11 +305,100 @@ impl FeedSnapshot {
     pub fn empty() -> Self {
         Self::new(Bytes::new(), String::new(), None)
     }
+
+    /// 時刻 `now` に送出する `Last-Modified`。`now` 以前の値のみを返す
+    /// (RFC 9110 §8.8.2.1: Date より後の Last-Modified を生成してはならない)。
+    pub fn last_modified_at(&self, now: time::OffsetDateTime) -> Option<LastModifiedAt<'_>> {
+        let value = self.last_modified?;
+        let header = self.last_modified_header.as_ref()?;
+        if !self.last_modified_ambiguous {
+            return Some(LastModifiedAt {
+                value,
+                header,
+                weak: false,
+            });
+        }
+        let value = truncate_to_second(value);
+        if truncate_to_second(now) > value {
+            // 曖昧だった秒は過ぎた。以降の取得者は全員その秒の最終版を見るので、
+            // +1秒の値で区別できる(本文の変更より後の時刻であり、Dateも超えない)
+            let next = self.last_modified_next_header.as_ref()?;
+            return Some(LastModifiedAt {
+                value: value + time::Duration::SECOND,
+                header: next,
+                weak: false,
+            });
+        }
+        Some(LastModifiedAt {
+            value,
+            header,
+            weak: true,
+        })
+    }
+
+    /// `If-Modified-Since` を時刻 `now` で評価し、304を返してよければ true。
+    pub fn not_modified_since(&self, if_modified_since: &str, now: time::OffsetDateTime) -> bool {
+        self.last_modified_at(now).is_some_and(|lm| {
+            !lm.weak && crate::http::etag::not_modified_since(if_modified_since, lm.value)
+        })
+    }
+}
+
+/// IMF-fixdateは秒粒度のため、`Last-Modified` の比較・繰り上げは秒単位で行う。
+pub fn truncate_to_second(dt: time::OffsetDateTime) -> time::OffsetDateTime {
+    dt.replace_nanosecond(0)
+        .expect("0 is always a valid nanosecond")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(lm: time::OffsetDateTime, ambiguous: bool) -> FeedSnapshot {
+        FeedSnapshot::with_last_modified(
+            Bytes::from_static(b"x"),
+            String::new(),
+            Some(lm),
+            ambiguous,
+        )
+    }
+
+    #[test]
+    fn last_modified_at_unambiguous_is_fixed() {
+        let lm = time::macros::datetime!(2026-07-05 04:20:00 UTC);
+        let s = snapshot(lm, false);
+        let at = s.last_modified_at(lm).unwrap();
+        assert_eq!((at.value, at.weak), (lm, false));
+        assert!(s.not_modified_since("Sun, 05 Jul 2026 04:20:00 GMT", lm));
+    }
+
+    #[test]
+    fn last_modified_at_ambiguous_is_weak_within_the_second() {
+        let lm = time::macros::datetime!(2026-07-05 04:20:00 UTC);
+        let s = snapshot(lm, true);
+        let now = time::macros::datetime!(2026-07-05 04:20:00.9 UTC);
+        let at = s.last_modified_at(now).unwrap();
+        assert_eq!((at.value, at.weak), (lm, true));
+        assert_eq!(at.header, "Sun, 05 Jul 2026 04:20:00 GMT");
+        // 弱い間は IMS が一致・未来でも304にしない
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 04:20:00 GMT", now));
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 05:00:00 GMT", now));
+    }
+
+    #[test]
+    fn last_modified_at_ambiguous_advances_after_the_second() {
+        let lm = time::macros::datetime!(2026-07-05 04:20:00 UTC);
+        let s = snapshot(lm, true);
+        let now = time::macros::datetime!(2026-07-05 04:20:01 UTC);
+        let at = s.last_modified_at(now).unwrap();
+        assert_eq!(
+            (at.value, at.weak),
+            (time::macros::datetime!(2026-07-05 04:20:01 UTC), false)
+        );
+        assert_eq!(at.header, "Sun, 05 Jul 2026 04:20:01 GMT");
+        assert!(!s.not_modified_since("Sun, 05 Jul 2026 04:20:00 GMT", now));
+        assert!(s.not_modified_since("Sun, 05 Jul 2026 04:20:01 GMT", now));
+    }
 
     #[test]
     fn normalize_rfc3339_converts_utc_z_to_jst() {

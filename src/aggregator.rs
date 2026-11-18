@@ -12,6 +12,7 @@ use crate::jma::feed_render;
 use crate::state::SharedState;
 use crate::types::{
     DedupKey, EntityEntry, Event, EventSource, FeedSnapshot, ItemMeta, LatestEntries,
+    truncate_to_second,
 };
 
 /// Aggregatorタスク本体。`initial_metas` は起動時の初期一覧(新しい順)。
@@ -142,6 +143,12 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .map(|m| m.updated.clone())
         .unwrap_or_else(feed_render::now_jst_rfc3339);
 
+    let previous = state.feed.load();
+    if previous.body == body {
+        // 本文が同一なら Last-Modified の状態ごと現スナップショットを維持する
+        return;
+    }
+
     // Last-Modified 用時刻の算出は next_last_modified を参照。
     // feed本文の <updated> は従来どおり先頭entryの値のまま。
     let rfc3339 = time::format_description::well_known::Rfc3339;
@@ -149,54 +156,51 @@ fn publish(state: &SharedState, metas: &mut VecDeque<ItemMeta>, base_url: &str) 
         .iter()
         .filter_map(|m| time::OffsetDateTime::parse(&m.updated, &rfc3339).ok())
         .max();
-    let previous = state.feed.load();
-    let body_changed = previous.body != body;
-    let last_modified = next_last_modified(
-        max_updated,
-        previous.last_modified,
-        body_changed,
-        time::OffsetDateTime::now_utc(),
-    );
+    let now = time::OffsetDateTime::now_utc();
+    let previous_lm = previous.last_modified_at(now).map(|lm| lm.value);
+    let next = next_last_modified(max_updated, previous_lm, now);
 
-    state.feed.store(Arc::new(FeedSnapshot::new(
+    state.feed.store(Arc::new(FeedSnapshot::with_last_modified(
         body,
         last_updated,
-        last_modified,
+        next.map(|(value, _)| value),
+        next.is_some_and(|(_, ambiguous)| ambiguous),
     )));
 }
 
-/// `Last-Modified` 用時刻を決める。
+/// 本文が変わったときの `Last-Modified` 用時刻と、その秒が曖昧かどうかを決める。
 ///
-/// 基本は「パース可能な updated の最大値」を前回値より小さくならないよう clamp した値
-/// (訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
+/// - 基本は「パース可能な updated の最大値」を、前回の送出値より小さくならないよう
+///   clamp した値(訂正報の ReportDateTime 逆順による後退誤検知を防ぐ)。
+/// - Date より未来の値は生成してはならない(RFC 9110 §8.8.2.1)ため `now` で頭打ちにする
+///   (dmdataとの時計のずれで updated が未来になる場合も含む)。
+/// - 本文が変わったのに前回値から秒粒度で進まない場合(同一発表時刻の電文が続く・
+///   古い updated の電文が遅れて届く)、そのままでは `If-Modified-Since` のみで再検証する
+///   クライアントに古い本文で304を返してしまう。そこで現在時刻へ進める。
+/// - 現在時刻も前回値と同じ秒なら、Dateを超えずに進める手段がない。前回値のまま
+///   「曖昧」とし、その秒の間は弱い検証子として扱う([`FeedSnapshot::last_modified_at`])。
 ///
-/// ただし本文が変わったのに、その値が前回値から(IMF-fixdateの秒粒度で)進まない場合がある。
-/// 同一発表時刻の電文が続く場合や、古い updated の電文が遅れて届いた場合である。このとき
-/// `If-Modified-Since` だけで再検証するクライアントに古い本文のまま 304 を返してしまう。
-/// そこで、本文が変わったときは前回値より必ず1秒以上進める。その時刻は現在時刻と
-/// 前回値+1秒の遅い方とする。同一秒内に変更が連続すると現在時刻より先行し得るが、
-/// 304判定は自サーバが出した値同士の比較なので整合は保たれる。
+/// `previous` は前スナップショットの現時点での送出値(曖昧な秒を過ぎていれば+1秒済み)。
+/// 戻り値は秒単位に切り捨て済み。
 fn next_last_modified(
     max_updated: Option<time::OffsetDateTime>,
     previous: Option<time::OffsetDateTime>,
-    body_changed: bool,
     now: time::OffsetDateTime,
-) -> Option<time::OffsetDateTime> {
-    let Some(previous) = previous else {
-        return max_updated;
+) -> Option<(time::OffsetDateTime, bool)> {
+    let now = truncate_to_second(now);
+    let capped = max_updated.map(|a| truncate_to_second(a).min(now));
+    let Some(previous) = previous.map(truncate_to_second) else {
+        return capped.map(|value| (value, false));
     };
-    let candidate = max_updated.map_or(previous, |a| a.max(previous));
-    if !body_changed || truncate_to_second(candidate) > truncate_to_second(previous) {
-        return Some(candidate);
+    let candidate = capped.map_or(previous, |a| a.max(previous));
+    if candidate > previous {
+        return Some((candidate, false));
     }
-    let bumped = truncate_to_second(previous) + time::Duration::SECOND;
-    Some(bumped.max(truncate_to_second(now).to_offset(bumped.offset())))
-}
-
-/// IMF-fixdateは秒粒度のため、比較・繰り上げは秒単位で行う。
-fn truncate_to_second(dt: time::OffsetDateTime) -> time::OffsetDateTime {
-    dt.replace_nanosecond(0)
-        .expect("0 is always a valid nanosecond")
+    if now > previous {
+        return Some((now, false));
+    }
+    // 同一秒内の再変更(または時計の後退)。単調性を優先して前回値を保つ
+    Some((previous, true))
 }
 
 #[cfg(test)]
@@ -209,63 +213,87 @@ mod tests {
     #[test]
     fn first_publish_uses_max_updated() {
         let a = datetime!(2026-07-05 04:10:00 +09:00);
-        assert_eq!(next_last_modified(Some(a), None, true, NOW), Some(a));
-        assert_eq!(next_last_modified(None, None, true, NOW), None);
+        assert_eq!(next_last_modified(Some(a), None, NOW), Some((a, false)));
+        assert_eq!(next_last_modified(None, None, NOW), None);
     }
 
     #[test]
     fn newer_updated_advances() {
         let prev = datetime!(2026-07-05 04:10:00 +09:00);
         let a = datetime!(2026-07-05 04:15:00 +09:00);
-        assert_eq!(next_last_modified(Some(a), Some(prev), true, NOW), Some(a));
-    }
-
-    #[test]
-    fn unchanged_body_keeps_previous() {
-        let prev = datetime!(2026-07-05 04:10:00 +09:00);
         assert_eq!(
-            next_last_modified(Some(prev), Some(prev), false, NOW),
-            Some(prev)
+            next_last_modified(Some(a), Some(prev), NOW),
+            Some((a, false))
         );
     }
 
     #[test]
-    fn changed_body_with_same_updated_bumps_to_now() {
+    fn future_updated_is_capped_at_now() {
+        let future = datetime!(2026-07-05 04:20:05 +09:00);
+        let now = datetime!(2026-07-05 04:20:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(future), None, NOW),
+            Some((now, false))
+        );
         let prev = datetime!(2026-07-05 04:10:00 +09:00);
         assert_eq!(
-            next_last_modified(Some(prev), Some(prev), true, NOW),
-            Some(datetime!(2026-07-05 04:20:00 +09:00))
+            next_last_modified(Some(future), Some(prev), NOW),
+            Some((now, false))
         );
     }
 
     #[test]
-    fn changed_body_with_older_updated_bumps() {
+    fn same_updated_advances_to_now() {
+        let prev = datetime!(2026-07-05 04:10:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(prev), Some(prev), NOW),
+            Some((datetime!(2026-07-05 04:20:00 +09:00), false))
+        );
+    }
+
+    #[test]
+    fn older_updated_advances_to_now() {
         let prev = datetime!(2026-07-05 04:10:00 +09:00);
         let older = datetime!(2026-07-05 04:05:00 +09:00);
         assert_eq!(
-            next_last_modified(Some(older), Some(prev), true, NOW),
-            Some(datetime!(2026-07-05 04:20:00 +09:00))
+            next_last_modified(Some(older), Some(prev), NOW),
+            Some((datetime!(2026-07-05 04:20:00 +09:00), false))
         );
     }
 
     #[test]
-    fn bump_is_at_least_one_second_when_previous_is_ahead_of_now() {
-        // 同一秒内の連続変更で前回値が現在時刻より先行している場合
+    fn change_within_same_second_as_previous_is_ambiguous() {
+        // 前回値が現在と同じ秒: Dateを超えて進められないので曖昧として保つ
+        let prev = datetime!(2026-07-05 04:20:00 +09:00);
+        assert_eq!(
+            next_last_modified(Some(prev), Some(prev), NOW),
+            Some((prev, true))
+        );
+    }
+
+    #[test]
+    fn clock_going_backwards_keeps_previous_as_ambiguous() {
         let prev = datetime!(2026-07-05 04:20:03 +09:00);
         assert_eq!(
-            next_last_modified(Some(prev), Some(prev), true, NOW),
-            Some(datetime!(2026-07-05 04:20:04 +09:00))
+            next_last_modified(Some(prev), Some(prev), NOW),
+            Some((prev, true))
         );
     }
 
     #[test]
-    fn subsecond_advance_within_same_second_still_bumps() {
-        // IMF-fixdate上で同じ秒になる前進は「進んだ」とみなさない
-        let prev = datetime!(2026-07-05 04:20:10.1 +09:00);
-        let a = datetime!(2026-07-05 04:20:10.9 +09:00);
-        assert_eq!(
-            next_last_modified(Some(a), Some(prev), true, NOW),
-            Some(datetime!(2026-07-05 04:20:11 +09:00))
-        );
+    fn result_never_exceeds_now() {
+        let now_s = datetime!(2026-07-05 04:20:00 +09:00);
+        let cases = [
+            (None, None),
+            (Some(datetime!(2026-07-05 05:00:00 +09:00)), None),
+            (Some(now_s), Some(now_s)),
+            (Some(datetime!(2026-07-05 04:00:00 +09:00)), Some(now_s)),
+            (Some(datetime!(2026-07-05 05:00:00 +09:00)), Some(now_s)),
+        ];
+        for (max_updated, previous) in cases {
+            if let Some((value, _)) = next_last_modified(max_updated, previous, NOW) {
+                assert!(value <= now_s, "{max_updated:?} {previous:?} -> {value}");
+            }
+        }
     }
 }

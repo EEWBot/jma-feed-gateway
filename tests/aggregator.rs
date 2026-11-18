@@ -1154,3 +1154,43 @@ async fn cache_fill_fills_latest_without_entry() {
     }
     panic!("latest entry was not filled by cache fill");
 }
+
+#[tokio::test]
+async fn last_modified_never_exceeds_now_under_burst() {
+    let (state, tx) = setup(20, Vec::new()).await;
+    let mut etag = state.feed.load_full().etag.clone();
+    let mut seen_ims: Vec<String> = Vec::new();
+
+    // 同一発表時刻の電文を立て続けに投入(同一秒内の連続更新を誘発する)
+    for i in 0..10 {
+        tx.send(dmdata_event(
+            &format!("t-{i}"),
+            meta(&format!("id-{i}"), "同時刻", "2026-07-05T04:20:00+09:00"),
+        ))
+        .await
+        .unwrap();
+        wait_for_feed_change(&state, &etag).await;
+        let snapshot = state.feed.load_full();
+        etag = snapshot.etag.clone();
+
+        let now = time::OffsetDateTime::now_utc();
+        let lm = snapshot
+            .last_modified_at(now)
+            .expect("last_modified must be set");
+        assert!(
+            lm.value <= now,
+            "Last-Modified {} exceeds now {now}",
+            lm.value
+        );
+        // 以前の版で得た Last-Modified による再検証は、どれも304にならない
+        for ims in &seen_ims {
+            assert!(
+                !snapshot.not_modified_since(ims, now),
+                "stale IMS {ims} must not yield 304 (lm={}, weak={})",
+                lm.value,
+                lm.weak
+            );
+        }
+        seen_ims.push(lm.header.to_str().unwrap().to_string());
+    }
+}

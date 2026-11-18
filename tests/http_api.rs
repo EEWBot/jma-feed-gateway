@@ -1002,3 +1002,65 @@ async fn latest_fetch_timeout_returns_504() {
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(header_str(&response, "cache-control"), Some("no-store"));
 }
+
+/// 同一秒内に本文が複数回変わったスナップショット(曖昧な秒)を差し込む。
+fn store_ambiguous_feed(state: &SharedState, last_modified: time::OffsetDateTime) {
+    state.feed.store(Arc::new(FeedSnapshot::with_last_modified(
+        Bytes::from_static(b"<?xml version=\"1.0\"?><feed>second version</feed>"),
+        "2026-07-05T04:10:12+09:00".into(),
+        Some(last_modified),
+        true,
+    )));
+}
+
+#[tokio::test]
+async fn feed_ambiguous_second_never_returns_304_for_if_modified_since() {
+    let (state, router) = setup().await;
+    // 現在の秒を曖昧にする。テスト中に秒をまたいでも+1秒の値と比べるので200になる
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap();
+    store_ambiguous_feed(&state, now);
+    let ims = jma_feed_gateway::types::format_imf_fixdate(now);
+
+    let response = get_with_headers(&router, FEED_PATH, &[(header::IF_MODIFIED_SINCE, &ims)]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // 送出する Last-Modified は Date(=現在)を超えない
+    let lm = header_str(&response, "last-modified").unwrap();
+    let lm = jma_feed_gateway::types::parse_imf_fixdate(lm).unwrap();
+    assert!(lm <= time::OffsetDateTime::now_utc());
+}
+
+#[tokio::test]
+async fn feed_ambiguous_second_advances_by_one_second_after_it_passes() {
+    let (state, router) = setup().await;
+    // FEED_LAST_MODIFIED の秒は既に過去
+    let lm = jma_feed_gateway::types::parse_imf_fixdate(FEED_LAST_MODIFIED).unwrap();
+    store_ambiguous_feed(&state, lm);
+
+    // 曖昧な秒の値を持つクライアントには200 + 1秒進めた Last-Modified
+    let response = get_with_headers(
+        &router,
+        FEED_PATH,
+        &[(header::IF_MODIFIED_SINCE, FEED_LAST_MODIFIED)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, "last-modified"),
+        Some("Sat, 04 Jul 2026 19:10:13 GMT")
+    );
+
+    // 進めた値での再検証は304
+    let response = get_with_headers(
+        &router,
+        FEED_PATH,
+        &[(header::IF_MODIFIED_SINCE, "Sat, 04 Jul 2026 19:10:13 GMT")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        header_str(&response, "last-modified"),
+        Some("Sat, 04 Jul 2026 19:10:13 GMT")
+    );
+}
